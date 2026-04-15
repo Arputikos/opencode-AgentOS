@@ -930,6 +930,38 @@ export const SessionRoutes = lazy(() =>
       },
     )
     .post(
+      "/:sessionID/resume",
+      describeRoute({
+        summary: "Resume session agent loop",
+        description:
+          "Start the agent loop for a session without creating a new user message. " +
+          "Used after a server restart or crash when the session has in-flight tool calls that need to continue. " +
+          "Returns immediately; the loop runs in the background.",
+        operationId: "session.resume",
+        responses: {
+          204: { description: "Resume accepted" },
+          ...errors(400, 404),
+        },
+      }),
+      validator(
+        "param",
+        z.object({
+          sessionID: SessionID.zod,
+        }),
+      ),
+      async (c) => {
+        const sessionID = c.req.valid("param").sessionID
+        AppRuntime.runPromise(SessionPrompt.Service.use((svc) => svc.loop({ sessionID }))).catch((err) => {
+          log.error("resume failed", { sessionID, error: err })
+          Bus.publish(Session.Event.Error, {
+            sessionID,
+            error: new NamedError.Unknown({ message: err instanceof Error ? err.message : String(err) }).toObject(),
+          })
+        })
+        return c.body(null, 204)
+      },
+    )
+    .post(
       "/:sessionID/command",
       describeRoute({
         summary: "Send command",
