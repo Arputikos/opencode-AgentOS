@@ -2,89 +2,104 @@ import fs from "fs/promises"
 import path from "path"
 import { fileURLToPath } from "url"
 import z from "zod"
-import { Cause, Context, Effect, Layer, Queue, Stream } from "effect"
+import { Cause, Context, Effect, Layer, Queue, Schema, Stream } from "effect"
 import { ripgrep } from "ripgrep"
 import { makeRuntime } from "@/effect/run-service"
+import { zod } from "@/util/effect-zod"
 import { Filesystem } from "@/util/filesystem"
 import { Log } from "@/util/log"
 
 export namespace Ripgrep {
   const log = Log.create({ service: "ripgrep" })
 
-  const Stats = z.object({
-    elapsed: z.object({
-      secs: z.number(),
-      nanos: z.number(),
-      human: z.string(),
+  const statsSchema = Schema.Struct({
+    elapsed: Schema.Struct({
+      secs: Schema.Number,
+      nanos: Schema.Number,
+      human: Schema.String,
     }),
-    searches: z.number(),
-    searches_with_match: z.number(),
-    bytes_searched: z.number(),
-    bytes_printed: z.number(),
-    matched_lines: z.number(),
-    matches: z.number(),
+    searches: Schema.Number,
+    searches_with_match: Schema.Number,
+    bytes_searched: Schema.Number,
+    bytes_printed: Schema.Number,
+    matched_lines: Schema.Number,
+    matches: Schema.Number,
   })
 
-  const Begin = z.object({
-    type: z.literal("begin"),
-    data: z.object({
-      path: z.object({
-        text: z.string(),
+  const beginSchema = Schema.Struct({
+    type: Schema.Literal("begin"),
+    data: Schema.Struct({
+      path: Schema.Struct({
+        text: Schema.String,
       }),
     }),
   })
 
-  export const Match = z.object({
-    type: z.literal("match"),
-    data: z.object({
-      path: z.object({
-        text: z.string(),
-      }),
-      lines: z.object({
-        text: z.string(),
-      }),
-      line_number: z.number(),
-      absolute_offset: z.number(),
-      submatches: z.array(
-        z.object({
-          match: z.object({
-            text: z.string(),
+  const itemSchema = Schema.Struct({
+    path: Schema.Struct({
+      text: Schema.String,
+    }),
+    lines: Schema.Struct({
+      text: Schema.String,
+    }),
+    line_number: Schema.Number,
+    absolute_offset: Schema.Number,
+    submatches: Schema.mutable(
+      Schema.Array(
+        Schema.Struct({
+          match: Schema.Struct({
+            text: Schema.String,
           }),
-          start: z.number(),
-          end: z.number(),
+          start: Schema.Number,
+          end: Schema.Number,
         }),
       ),
-    }),
+    ),
   })
 
-  const End = z.object({
-    type: z.literal("end"),
-    data: z.object({
-      path: z.object({
-        text: z.string(),
+  const matchSchema = Schema.Struct({
+    type: Schema.Literal("match"),
+    data: itemSchema,
+  })
+
+  const endSchema = Schema.Struct({
+    type: Schema.Literal("end"),
+    data: Schema.Struct({
+      path: Schema.Struct({
+        text: Schema.String,
       }),
-      binary_offset: z.number().nullable(),
-      stats: Stats,
+      binary_offset: Schema.NullOr(Schema.Number),
+      stats: statsSchema,
     }),
   })
 
-  const Summary = z.object({
-    type: z.literal("summary"),
-    data: z.object({
-      elapsed_total: z.object({
-        human: z.string(),
-        nanos: z.number(),
-        secs: z.number(),
+  const summarySchema = Schema.Struct({
+    type: Schema.Literal("summary"),
+    data: Schema.Struct({
+      elapsed_total: Schema.Struct({
+        human: Schema.String,
+        nanos: Schema.Number,
+        secs: Schema.Number,
       }),
-      stats: Stats,
+      stats: statsSchema,
     }),
   })
 
-  const Result = z.union([Begin, Match, End, Summary])
+  const resultSchema = Schema.Union([beginSchema, matchSchema, endSchema, summarySchema])
+  const decode = Schema.decodeUnknownSync(Schema.fromJsonString(resultSchema))
 
+  export const Stats = zod(statsSchema)
+  export const Begin = zod(beginSchema)
+  export const Item = zod(itemSchema)
+  export const Match = zod(matchSchema)
+  export const End = zod(endSchema)
+  export const Summary = zod(summarySchema)
+  export const Result = zod(resultSchema)
+
+  export type Stats = z.infer<typeof Stats>
   export type Result = z.infer<typeof Result>
   export type Match = z.infer<typeof Match>
-  export type Item = Match["data"]
+  export type Item = z.infer<typeof Item>
   export type Begin = z.infer<typeof Begin>
   export type End = z.infer<typeof End>
   export type Summary = z.infer<typeof Summary>
@@ -196,7 +211,7 @@ export namespace Ripgrep {
     return path.normalize(file.replace(/^\.[\\/]/, ""))
   }
 
-  function row(data: Row): Row {
+  function normalizeRow(data: Row): Row {
     return {
       ...data,
       path: {
@@ -264,8 +279,8 @@ export namespace Ripgrep {
       .trim()
       .split(/\r?\n/)
       .filter(Boolean)
-      .map((line) => Result.parse(JSON.parse(line)))
-      .flatMap((item) => (item.type === "match" ? [row(item.data)] : []))
+      .map((line) => decode(line))
+      .flatMap((item) => (item.type === "match" ? [normalizeRow(item.data)] : []))
   }
 
   declare const OPENCODE_RIPGREP_WORKER_PATH: string
