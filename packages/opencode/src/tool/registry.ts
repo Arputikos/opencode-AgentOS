@@ -133,13 +133,61 @@ export namespace ToolRegistry {
               description: def.description,
               execute: (args, toolCtx) =>
                 Effect.gen(function* () {
+                  // Bridge ask() from Effect → Promise so plugin's `await context.ask()`
+                  // actually blocks until the permission is resolved. Without this,
+                  // `await` on an Effect object resolves immediately (Effect is not thenable).
+                  // We use a pending ask queue: plugin calls ask() → returns Promise →
+                  // plugin awaits → we yield* the Effect in our generator → resolve Promise.
+                  const pendingAsks: Array<{
+                    req: Omit<Permission.Request, "id" | "sessionID" | "tool">;
+                    resolve: () => void;
+                    reject: (err: unknown) => void;
+                  }> = [];
+
                   const pluginCtx: PluginToolContext = {
                     ...toolCtx,
-                    ask: (req) => toolCtx.ask(req),
+                    ask: (req) => {
+                      // Return a Promise that blocks the plugin's async execute().
+                      // The Effect is queued and executed by the outer generator.
+                      const promise = new Promise<void>((resolve, reject) => {
+                        pendingAsks.push({ req, resolve, reject });
+                      });
+                      return promise as any; // Plugin expects Promise<void>, we deliver
+                    },
                     directory: ctx.directory,
                     worktree: ctx.worktree,
                   }
-                  const result = yield* Effect.promise(() => def.execute(args as any, pluginCtx))
+
+                  // Run plugin execute in background — it may call ask() which queues entries
+                  let pluginResult: string | undefined;
+                  let pluginError: unknown;
+                  let pluginDone = false;
+                  const pluginPromise = def.execute(args as any, pluginCtx)
+                    .then((r) => { pluginResult = r; pluginDone = true; })
+                    .catch((e) => { pluginError = e; pluginDone = true; });
+
+                  // Process ask queue: yield* each Effect (blocking in our generator),
+                  // then resolve the plugin's awaiting Promise.
+                  while (!pluginDone) {
+                    // Wait a tick for plugin to call ask() or finish
+                    yield* Effect.sleep("10 millis");
+
+                    while (pendingAsks.length > 0) {
+                      const entry = pendingAsks.shift()!;
+                      try {
+                        yield* toolCtx.ask(entry.req);
+                        entry.resolve();
+                      } catch (err) {
+                        entry.reject(err);
+                      }
+                    }
+                  }
+
+                  // Wait for plugin promise to fully settle
+                  yield* Effect.promise(() => pluginPromise);
+
+                  if (pluginError) throw pluginError;
+                  const result = pluginResult ?? "";
                   const info = yield* agent.get(toolCtx.agent)
                   const out = yield* truncate.output(result, {}, info)
                   return {
