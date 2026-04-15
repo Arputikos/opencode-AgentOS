@@ -53,7 +53,7 @@ export namespace LLM {
 
   export class Service extends Context.Service<Service, Interface>()("@opencode/LLM") {}
 
-  export const layer: Layer.Layer<
+  const live: Layer.Layer<
     Service,
     never,
     Auth.Service | Config.Service | Provider.Service | Plugin.Service | Permission.Service
@@ -410,13 +410,14 @@ export namespace LLM {
     }),
   )
 
+  export const layer = live.pipe(Layer.provide(Permission.defaultLayer))
+
   export const defaultLayer = Layer.suspend(() =>
     layer.pipe(
       Layer.provide(Auth.defaultLayer),
       Layer.provide(Config.defaultLayer),
       Layer.provide(Provider.defaultLayer),
       Layer.provide(Plugin.defaultLayer),
-      Layer.provide(Permission.defaultLayer),
     ),
   )
 
