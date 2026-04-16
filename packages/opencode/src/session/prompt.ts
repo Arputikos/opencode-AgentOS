@@ -1312,6 +1312,210 @@ NOTE: At any point in time through this workflow you should feel free to ask the
         throw new Error("Impossible")
       })
 
+      /**
+       * After a server restart, the Permission.pending Deferred map is gone but
+       * tool parts that were mid-HITL remain in SQLite with state.status
+       * "pending" or "running". /resume calls runLoop, but runLoop's own logic
+       * only writes new assistant messages — it never re-drives those orphans.
+       * For plugin tools (context.ask()) the LLM often re-issues them after seeing
+       * the synthesized "[Tool execution was interrupted]" output-error, but
+       * for built-in tools (bash/edit/…) the LLM typically gives up or
+       * hallucinates — the tool never actually runs after restart.
+       *
+       * This helper closes that gap DETERMINISTICALLY. Before the first loop
+       * step, it finds every orphaned pending/running tool part on the most
+       * recent assistant message and re-executes each one with the original
+       * stored input. The execution uses the normal Tool.Context pipeline
+       * (same permission.ask path) — a fresh permission.asked fires with a
+       * new permissionId, downstream consumers (AgentOS orchestrator) handle
+       * it with their standard re-attach/auto-approve logic, the tool runs
+       * for real, and the final output is patched back onto the SAME part
+       * (same id/messageID/callID) so the conversation history stays coherent.
+       *
+       * If the re-invoked tool's permission is rejected or the tool itself
+       * throws, the orphan part is patched as status="error" with the real
+       * error message — no fake "[Human approved]" placeholder.
+       */
+      const resumeOrphanTools = Effect.fn("SessionPrompt.resumeOrphanTools")(function* (sessionID: SessionID) {
+        const msgs = yield* MessageV2.filterCompactedEffect(sessionID)
+        const lastAsst = msgs.findLast((m) => m.info.role === "assistant")
+        if (!lastAsst || lastAsst.info.role !== "assistant") return
+        const orphans = lastAsst.parts.filter(
+          (p): p is MessageV2.ToolPart =>
+            p.type === "tool" && (p.state.status === "pending" || p.state.status === "running"),
+        )
+        if (orphans.length === 0) return
+
+        const lastUserMsg = msgs.findLast((m) => m.info.role === "user")
+        if (!lastUserMsg || lastUserMsg.info.role !== "user") return
+        const lastUser = lastUserMsg.info
+        const agent = yield* agents.get(lastUser.agent)
+        if (!agent) return
+        const model = yield* getModel(lastUser.model.providerID, lastUser.model.modelID, sessionID)
+        const session = yield* sessions.get(sessionID)
+
+        yield* elog.info("resumeOrphanTools", { sessionID, count: orphans.length })
+
+        // Two tool namespaces: built-in + plugin (in registry.all()) and MCP
+        // (in mcp.tools()). After a restart MCP servers may be cold — calling
+        // mcp.tools() triggers their startup, which is exactly what we want
+        // since we're about to execute one of their tools.
+        const defs = yield* registry.all()
+        const defById = new Map(defs.map((d) => [d.id, d]))
+        let mcpToolsCache: Record<string, { execute?: Function }> | null = null
+
+        for (const orphan of orphans) {
+          const abortCtrl = new AbortController()
+          const startTime =
+            "time" in orphan.state && orphan.state.time?.start ? orphan.state.time.start : Date.now()
+          const input = "input" in orphan.state ? orphan.state.input : {}
+
+          // Shared ask helper — fires fresh permission.asked with same messageID/callID.
+          const askFn = (req: Omit<Permission.Request, "id" | "sessionID" | "tool">) =>
+            permission
+              .ask({
+                ...req,
+                sessionID,
+                tool: { messageID: orphan.messageID, callID: orphan.callID },
+                ruleset: Permission.merge(agent.permission, session.permission ?? []),
+              })
+              .pipe(Effect.orDie)
+
+          const def = defById.get(orphan.tool)
+          if (def) {
+            // Built-in / plugin tool — execute via the standard Tool.Context pipeline.
+            const toolCtx: Tool.Context = {
+              sessionID,
+              messageID: orphan.messageID,
+              agent: agent.name,
+              abort: abortCtrl.signal,
+              callID: orphan.callID,
+              extra: { model, bypassAgentCheck: false },
+              messages: msgs,
+              metadata: (val) =>
+                Effect.gen(function* () {
+                  yield* sessions.updatePart({
+                    ...orphan,
+                    state: {
+                      title: val.title,
+                      metadata: val.metadata ?? {},
+                      status: "running",
+                      input,
+                      time: { start: startTime },
+                    },
+                  } satisfies MessageV2.ToolPart)
+                }),
+              ask: askFn,
+            }
+
+            const exit = yield* def.execute(input, toolCtx).pipe(Effect.exit)
+            if (Exit.isSuccess(exit)) {
+              const result = exit.value
+              yield* sessions.updatePart({
+                ...orphan,
+                state: {
+                  status: "completed",
+                  input,
+                  output: result.output,
+                  metadata: result.metadata ?? {},
+                  title: result.title ?? "",
+                  time: { start: startTime, end: Date.now() },
+                },
+              } satisfies MessageV2.ToolPart)
+            } else {
+              const err = Cause.squash(exit.cause)
+              const message = err instanceof Error ? err.message : String(err)
+              yield* elog.warn("resumeOrphanTools.execute_failed", {
+                sessionID,
+                tool: orphan.tool,
+                callID: orphan.callID,
+                error: message,
+              })
+              yield* sessions.updatePart({
+                ...orphan,
+                state: {
+                  status: "error",
+                  input,
+                  error: message,
+                  time: { start: startTime, end: Date.now() },
+                },
+              } satisfies MessageV2.ToolPart)
+            }
+            continue
+          }
+
+          // Not in built-in / plugin registry — try MCP tools.
+          // mcp.tools() may trigger MCP server startup (cold start after restart).
+          if (!mcpToolsCache) {
+            const mcpExit = yield* mcp.tools().pipe(Effect.exit)
+            mcpToolsCache = Exit.isSuccess(mcpExit) ? mcpExit.value : {}
+          }
+          const mcpTool = mcpToolsCache[orphan.tool]
+          if (mcpTool?.execute) {
+            yield* elog.info("resumeOrphanTools.mcp_tool", { sessionID, tool: orphan.tool })
+
+            // MCP tool execution: permission.ask first, then call raw MCP execute.
+            const mcpExecExit = yield* Effect.gen(function* () {
+              yield* askFn({ permission: orphan.tool, metadata: {}, patterns: ["*"], always: ["*"] })
+              const result = (yield* Effect.promise(() =>
+                mcpTool.execute!(input, { toolCallId: orphan.callID, abortSignal: abortCtrl.signal } as any),
+              )) as { content: Array<{ type: string; text?: string }> }
+              const textParts = result.content
+                ?.filter((c: { type: string }) => c.type === "text")
+                .map((c: { text?: string }) => c.text ?? "")
+                .join("\n\n") ?? ""
+              return { title: "", output: textParts, metadata: {} }
+            }).pipe(Effect.exit)
+
+            if (Exit.isSuccess(mcpExecExit)) {
+              const result = mcpExecExit.value
+              yield* sessions.updatePart({
+                ...orphan,
+                state: {
+                  status: "completed",
+                  input,
+                  output: result.output,
+                  metadata: result.metadata,
+                  title: result.title,
+                  time: { start: startTime, end: Date.now() },
+                },
+              } satisfies MessageV2.ToolPart)
+            } else {
+              const err = Cause.squash(mcpExecExit.cause)
+              const message = err instanceof Error ? err.message : String(err)
+              yield* elog.warn("resumeOrphanTools.mcp_execute_failed", {
+                sessionID,
+                tool: orphan.tool,
+                callID: orphan.callID,
+                error: message,
+              })
+              yield* sessions.updatePart({
+                ...orphan,
+                state: {
+                  status: "error",
+                  input,
+                  error: message,
+                  time: { start: startTime, end: Date.now() },
+                },
+              } satisfies MessageV2.ToolPart)
+            }
+            continue
+          }
+
+          // Tool not found in any namespace — write a clear error.
+          yield* elog.warn("resumeOrphanTools.missing_tool", { sessionID, tool: orphan.tool })
+          yield* sessions.updatePart({
+            ...orphan,
+            state: {
+              status: "error",
+              input,
+              error: `Tool "${orphan.tool}" is not available after server restart (not in built-in registry or MCP)`,
+              time: { start: startTime, end: Date.now() },
+            },
+          } satisfies MessageV2.ToolPart)
+        }
+      })
+
       const runLoop: (sessionID: SessionID) => Effect.Effect<MessageV2.WithParts> = Effect.fn("SessionPrompt.run")(
         function* (sessionID: SessionID) {
           const ctx = yield* InstanceState.context
@@ -1319,6 +1523,14 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           let structured: unknown | undefined
           let step = 0
           const session = yield* sessions.get(sessionID)
+
+          // Patched (agentos/v1.4.6.3): re-drive any orphaned tool parts whose
+          // permission was in-flight when the server went down. See
+          // resumeOrphanTools above. This runs once before the normal loop so
+          // the LLM reads a clean "tool-call → tool-result" history on step 0.
+          yield* resumeOrphanTools(sessionID).pipe(
+            Effect.catchCause((cause) => slog.error("resumeOrphanTools failed", { error: Cause.squash(cause) })),
+          )
 
           while (true) {
             yield* status.set(sessionID, { type: "busy" })
