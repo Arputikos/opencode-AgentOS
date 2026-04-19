@@ -555,6 +555,25 @@ export namespace SessionProcessor {
               Effect.onInterrupt(() =>
                 Effect.gen(function* () {
                   aborted = true
+                  // Persist in-flight text and reasoning BEFORE halt() publishes
+                  // the idle event.  Without this, any transcript query triggered
+                  // by the idle/error SSE events would see text="" because
+                  // cleanup() runs AFTER halt().
+                  if (ctx.currentText) {
+                    const end = Date.now()
+                    ctx.currentText.time = { start: ctx.currentText.time?.start ?? end, end }
+                    yield* session.updatePart(ctx.currentText)
+                    ctx.currentText = undefined
+                  }
+                  for (const id of Object.keys(ctx.reasoningMap)) {
+                    const part = ctx.reasoningMap[id]
+                    const end = Date.now()
+                    yield* session.updatePart({
+                      ...part,
+                      time: { start: part.time.start ?? end, end },
+                    })
+                    delete ctx.reasoningMap[id]
+                  }
                   if (!ctx.assistantMessage.error) {
                     yield* halt(new DOMException("Aborted", "AbortError"))
                   }
