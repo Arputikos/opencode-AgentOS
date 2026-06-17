@@ -1742,6 +1742,8 @@ NOTE: At any point in time through this workflow you should feel free to ask the
               // `format.retryCount` failed attempts without ever producing a valid
               // object, stop looping and fail loudly with an accurate retry count
               // (upstream had no cap and always reported `retries: 0`).
+              // NB: retryCount counts corrective retries AFTER the first attempt —
+              // retryCount=3 gives the model 4 total chances before we give up.
               if (format.type === "json_schema" && structuredAttempts >= format.retryCount) {
                 handle.message.error = new MessageV2.StructuredOutputError({
                   message: "Model did not produce structured output matching the schema",
@@ -2064,7 +2066,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
 
   /** @internal Exported for testing */
   export function createStructuredOutputTool(input: {
-    schema: Record<string, any>
+    schema: Record<string, unknown>
     onSuccess: (output: unknown) => void
     onInvalid?: (errors: string) => void
   }): AITool {
@@ -2079,15 +2081,39 @@ NOTE: At any point in time through this workflow you should feel free to ask the
     // corrects on the next step. The caller bounds the corrective retries via
     // `structuredAttempts` + `format.retryCount`. The full `input.schema` (incl.
     // `$schema`) is handed to the validator so it picks the right draft.
-    const validator = new Validator(input.schema as any)
+    //
+    // `new Validator()` can throw synchronously for a malformed/unsupported
+    // schema (e.g. an unknown `$schema` dialect). Build it defensively: on a
+    // construction failure we degrade to treating every attempt as invalid so a
+    // broken schema yields a clean StructuredOutputError (retries exhausted)
+    // rather than crashing the agent loop.
+    let validator: Validator | undefined
+    let validatorError: string | undefined
+    try {
+      validator = new Validator(input.schema as any)
+    } catch (e) {
+      validatorError = `output_schema is not a valid JSON Schema: ${e instanceof Error ? e.message : String(e)}`
+    }
 
     return tool({
       id: "StructuredOutput" as any,
       description: STRUCTURED_OUTPUT_DESCRIPTION,
       inputSchema: jsonSchema(toolSchema as any),
       async execute(args) {
-        const result = validator.validate(args)
-        if (result.valid) {
+        let valid = false
+        let errors = validatorError ?? ""
+        if (validator) {
+          try {
+            const result = validator.validate(args)
+            valid = result.valid
+            if (!valid) {
+              errors = result.errors.map((e) => `${e.instanceLocation || "(root)"}: ${e.error}`).join("; ")
+            }
+          } catch (e) {
+            errors = `schema validation failed: ${e instanceof Error ? e.message : String(e)}`
+          }
+        }
+        if (valid) {
           input.onSuccess(args)
           return {
             output: "Structured output captured successfully.",
@@ -2095,9 +2121,6 @@ NOTE: At any point in time through this workflow you should feel free to ask the
             metadata: { valid: true },
           }
         }
-        const errors = result.errors
-          .map((e) => `${e.instanceLocation || "(root)"}: ${e.error}`)
-          .join("; ")
         input.onInvalid?.(errors)
         return {
           output:
