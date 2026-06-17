@@ -1521,6 +1521,10 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           const ctx = yield* InstanceState.context
           const slog = elog.with({ sessionID })
           let structured: unknown | undefined
+          // Patched (agentos): number of failed StructuredOutput attempts so far
+          // (schema-validation failures rewritten to the `invalid` tool). Bounds
+          // the structured-output corrective retry loop to `format.retryCount`.
+          let structuredAttempts = 0
           let step = 0
           const session = yield* sessions.get(sessionID)
 
@@ -1723,12 +1727,47 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                 return "break" as const
               }
 
+              // Patched (agentos): structured-output corrective retry cap.
+              // When the model calls StructuredOutput with input that fails the
+              // schema, AI SDK's experimental_repairToolCall (session/llm.ts)
+              // rewrites it to the synthetic `invalid` tool whose result
+              // ("The arguments provided to the tool are invalid: …") is fed
+              // back to the model; combined with STRUCTURED_OUTPUT_SYSTEM_PROMPT
+              // (re-added to the system prompt every step) the model is told to
+              // try again with a schema-conforming object, and the loop retries
+              // under toolChoice:"required". Upstream bounds that only by the
+              // agent's maxSteps and reports `retries: 0`. Here we bound it to
+              // `format.retryCount`: count each failed StructuredOutput attempt
+              // and, once exhausted, fail loudly with an accurate retry count.
+              if (format.type === "json_schema") {
+                const failedStructured = MessageV2.parts(handle.message.id).some(
+                  (p) =>
+                    p.type === "tool" &&
+                    p.tool === "invalid" &&
+                    p.state.status === "completed" &&
+                    typeof p.state.input === "object" &&
+                    p.state.input !== null &&
+                    (p.state.input as Record<string, unknown>)["tool"] === "StructuredOutput",
+                )
+                if (failedStructured) {
+                  structuredAttempts++
+                  if (structuredAttempts >= format.retryCount) {
+                    handle.message.error = new MessageV2.StructuredOutputError({
+                      message: "Model did not produce structured output matching the schema",
+                      retries: structuredAttempts,
+                    }).toObject()
+                    yield* sessions.updateMessage(handle.message)
+                    return "break" as const
+                  }
+                }
+              }
+
               const finished = handle.message.finish && !["tool-calls", "unknown"].includes(handle.message.finish)
               if (finished && !handle.message.error) {
                 if (format.type === "json_schema") {
                   handle.message.error = new MessageV2.StructuredOutputError({
                     message: "Model did not produce structured output",
-                    retries: 0,
+                    retries: structuredAttempts,
                   }).toObject()
                   yield* sessions.updateMessage(handle.message)
                   return "break" as const
