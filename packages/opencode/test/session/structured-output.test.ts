@@ -238,7 +238,53 @@ describe("structured-output.createStructuredOutputTool", () => {
     expect(result.metadata.valid).toBe(true)
   })
 
-  test("AI SDK validates schema before execute - missing required field", async () => {
+  test("execute rejects schema-violating args (enum), calls onInvalid not onSuccess", async () => {
+    let successCalled = false
+    let invalidErrors: string | undefined
+
+    const tool = SessionPrompt.createStructuredOutputTool({
+      schema: {
+        type: "object",
+        additionalProperties: false,
+        required: ["sentiment"],
+        properties: { sentiment: { type: "string", enum: ["positive", "negative"] } },
+      },
+      onSuccess: () => {
+        successCalled = true
+      },
+      onInvalid: (errors) => {
+        invalidErrors = errors
+      },
+    })
+
+    const result = await tool.execute!(
+      { sentiment: "banana", extra: 1 },
+      { toolCallId: "test-call-id", messages: [], abortSignal: undefined as any },
+    )
+
+    expect(successCalled).toBe(false)
+    expect(invalidErrors).toBeDefined()
+    expect(result.metadata.valid).toBe(false)
+    expect(result.output).toContain("did NOT match the required schema")
+  })
+
+  test("execute rejects missing required field", async () => {
+    let successCalled = false
+    const tool = SessionPrompt.createStructuredOutputTool({
+      schema: { type: "object", required: ["name", "age"], properties: { name: { type: "string" }, age: { type: "number" } } },
+      onSuccess: () => {
+        successCalled = true
+      },
+    })
+    const result = await tool.execute!(
+      { name: "only name" },
+      { toolCallId: "test-call-id", messages: [], abortSignal: undefined as any },
+    )
+    expect(successCalled).toBe(false)
+    expect(result.metadata.valid).toBe(false)
+  })
+
+  test("schema is exposed as inputSchema - missing required field", async () => {
     // Note: The AI SDK validates the input against the schema BEFORE calling execute()
     // So invalid inputs never reach the tool's execute function
     // This test documents the expected schema behavior
@@ -261,10 +307,10 @@ describe("structured-output.createStructuredOutputTool", () => {
     expect(inputSchema.jsonSchema?.required).toContain("age")
   })
 
-  test("AI SDK validates schema types before execute - wrong type", async () => {
-    // Note: The AI SDK validates the input against the schema BEFORE calling execute()
-    // So invalid inputs never reach the tool's execute function
-    // This test documents the expected schema behavior
+  test("schema is exposed as inputSchema - number type", async () => {
+    // The schema is handed to the model as the tool's inputSchema; runtime
+    // enforcement happens inside execute() via @cfworker/json-schema (see the
+    // "execute rejects …" tests above).
     const tool = SessionPrompt.createStructuredOutputTool({
       schema: {
         type: "object",

@@ -10,6 +10,7 @@ import { Agent } from "../agent/agent"
 import { Provider } from "../provider/provider"
 import { ModelID, ProviderID } from "../provider/schema"
 import { type Tool as AITool, tool, jsonSchema, type ToolExecutionOptions, asSchema } from "ai"
+import { Validator } from "@cfworker/json-schema"
 import { SessionCompaction } from "./compaction"
 import { Bus } from "../bus"
 import { ProviderTransform } from "../provider/transform"
@@ -1670,6 +1671,12 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                   onSuccess(output) {
                     structured = output
                   },
+                  onInvalid() {
+                    // A StructuredOutput call that failed schema validation —
+                    // counts as one corrective attempt. The error text was fed
+                    // back to the model inside the tool result.
+                    structuredAttempts++
+                  },
                 })
               }
 
@@ -1728,38 +1735,20 @@ NOTE: At any point in time through this workflow you should feel free to ask the
               }
 
               // Patched (agentos): structured-output corrective retry cap.
-              // When the model calls StructuredOutput with input that fails the
-              // schema, AI SDK's experimental_repairToolCall (session/llm.ts)
-              // rewrites it to the synthetic `invalid` tool whose result
-              // ("The arguments provided to the tool are invalid: …") is fed
-              // back to the model; combined with STRUCTURED_OUTPUT_SYSTEM_PROMPT
-              // (re-added to the system prompt every step) the model is told to
-              // try again with a schema-conforming object, and the loop retries
-              // under toolChoice:"required". Upstream bounds that only by the
-              // agent's maxSteps and reports `retries: 0`. Here we bound it to
-              // `format.retryCount`: count each failed StructuredOutput attempt
-              // and, once exhausted, fail loudly with an accurate retry count.
-              if (format.type === "json_schema") {
-                const failedStructured = MessageV2.parts(handle.message.id).some(
-                  (p) =>
-                    p.type === "tool" &&
-                    p.tool === "invalid" &&
-                    p.state.status === "completed" &&
-                    typeof p.state.input === "object" &&
-                    p.state.input !== null &&
-                    (p.state.input as Record<string, unknown>)["tool"] === "StructuredOutput",
-                )
-                if (failedStructured) {
-                  structuredAttempts++
-                  if (structuredAttempts >= format.retryCount) {
-                    handle.message.error = new MessageV2.StructuredOutputError({
-                      message: "Model did not produce structured output matching the schema",
-                      retries: structuredAttempts,
-                    }).toObject()
-                    yield* sessions.updateMessage(handle.message)
-                    return "break" as const
-                  }
-                }
+              // `createStructuredOutputTool` validates the model's output against
+              // the schema inside `execute`; on a mismatch it feeds the errors
+              // back to the model (which retries under toolChoice:"required") and
+              // bumps `structuredAttempts` via onInvalid. Once the model has burnt
+              // `format.retryCount` failed attempts without ever producing a valid
+              // object, stop looping and fail loudly with an accurate retry count
+              // (upstream had no cap and always reported `retries: 0`).
+              if (format.type === "json_schema" && structuredAttempts >= format.retryCount) {
+                handle.message.error = new MessageV2.StructuredOutputError({
+                  message: "Model did not produce structured output matching the schema",
+                  retries: structuredAttempts,
+                }).toObject()
+                yield* sessions.updateMessage(handle.message)
+                return "break" as const
               }
 
               const finished = handle.message.finish && !["tool-calls", "unknown"].includes(handle.message.finish)
@@ -2077,21 +2066,45 @@ NOTE: At any point in time through this workflow you should feel free to ask the
   export function createStructuredOutputTool(input: {
     schema: Record<string, any>
     onSuccess: (output: unknown) => void
+    onInvalid?: (errors: string) => void
   }): AITool {
     // Remove $schema property if present (not needed for tool input)
     const { $schema, ...toolSchema } = input.schema
+
+    // Patched (agentos): AI SDK does NOT enforce the JSON Schema at runtime —
+    // `jsonSchema()` without a validate callback is descriptive only, so a weak
+    // model can return values that violate enum/type/required/range constraints
+    // and they'd be silently accepted. Validate ourselves against the full
+    // schema and reject mismatches, feeding the errors back so the model
+    // corrects on the next step. The caller bounds the corrective retries via
+    // `structuredAttempts` + `format.retryCount`. The full `input.schema` (incl.
+    // `$schema`) is handed to the validator so it picks the right draft.
+    const validator = new Validator(input.schema as any)
 
     return tool({
       id: "StructuredOutput" as any,
       description: STRUCTURED_OUTPUT_DESCRIPTION,
       inputSchema: jsonSchema(toolSchema as any),
       async execute(args) {
-        // AI SDK validates args against inputSchema before calling execute()
-        input.onSuccess(args)
+        const result = validator.validate(args)
+        if (result.valid) {
+          input.onSuccess(args)
+          return {
+            output: "Structured output captured successfully.",
+            title: "Structured Output",
+            metadata: { valid: true },
+          }
+        }
+        const errors = result.errors
+          .map((e) => `${e.instanceLocation || "(root)"}: ${e.error}`)
+          .join("; ")
+        input.onInvalid?.(errors)
         return {
-          output: "Structured output captured successfully.",
-          title: "Structured Output",
-          metadata: { valid: true },
+          output:
+            `Your structured output did NOT match the required schema and was rejected:\n${errors}\n` +
+            `You MUST call the StructuredOutput tool again with a corrected object that strictly conforms to the schema.`,
+          title: "Structured Output (rejected — schema mismatch)",
+          metadata: { valid: false },
         }
       },
       toModelOutput({ output }) {
