@@ -58,6 +58,26 @@ export function WorkspaceRouterMiddleware(upgrade: UpgradeWebSocket): Middleware
       })(),
     )
 
+    // Agent OS shared-server: decouple instance identity from the desk `directory`
+    // so multiple sessions of the same agent (same desk) get isolated instances
+    // (MCP/LSP/config). Optional — absent headers fall back to upstream behavior
+    // (instance keyed by directory).
+    const instanceId = c.req.query("instance") || c.req.header("x-opencode-instance-id") || undefined
+    // config-dir: decode ONLY the URL-encoded query form. The header form is sent
+    // raw — HTTP header values are not percent-encoded, so decoding it would
+    // corrupt a path containing a literal '%'.
+    const configDirQuery = c.req.query("config_dir")
+    const configDir =
+      configDirQuery !== undefined
+        ? (() => {
+            try {
+              return decodeURIComponent(configDirQuery)
+            } catch {
+              return configDirQuery
+            }
+          })()
+        : c.req.header("x-opencode-instance-config-dir") || undefined
+
     const url = new URL(c.req.url)
 
     const sessionWorkspaceID = await getSessionWorkspace(url)
@@ -67,6 +87,8 @@ export function WorkspaceRouterMiddleware(upgrade: UpgradeWebSocket): Middleware
     if (!workspaceID) {
       return Instance.provide({
         directory,
+        instanceId,
+        configDir,
         init: () => AppRuntime.runPromise(InstanceBootstrap),
         async fn() {
           return next()
@@ -104,6 +126,8 @@ export function WorkspaceRouterMiddleware(upgrade: UpgradeWebSocket): Middleware
         fn: () =>
           Instance.provide({
             directory: target.directory,
+            instanceId,
+            configDir,
             init: () => AppRuntime.runPromise(InstanceBootstrap),
             async fn() {
               return next()

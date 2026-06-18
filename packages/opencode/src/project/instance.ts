@@ -9,9 +9,19 @@ import { Project } from "./project"
 import { WorkspaceContext } from "@/control-plane/workspace-context"
 
 export interface InstanceContext {
+  // Cache/scope key for this instance. Defaults to the resolved `directory`
+  // (upstream behavior). When an explicit instance id is supplied (Agent OS
+  // shared-server: many sessions of one agent share a desk `directory` but need
+  // separate MCP/LSP/config scopes), `key` decouples the instance identity from
+  // the cwd so they do not collapse into a single instance.
+  key: string
   directory: string
   worktree: string
   project: Project.Info
+  // Per-instance extra config dir (opencode.json) merged on top of global/project
+  // config. Lets each instance carry its own MCP set (e.g. per-session Playwright
+  // --user-data-dir) while sharing the desk `directory`.
+  configDir?: string
 }
 
 const context = LocalContext.create<InstanceContext>("instance")
@@ -22,9 +32,16 @@ const disposal = {
   all: undefined as Promise<void> | undefined,
 }
 
-function boot(input: { directory: string; init?: () => Promise<any>; worktree?: string; project?: Project.Info }) {
+function boot(input: {
+  key: string
+  directory: string
+  init?: () => Promise<any>
+  worktree?: string
+  project?: Project.Info
+  configDir?: string
+}) {
   return iife(async () => {
-    const ctx =
+    const base =
       input.project && input.worktree
         ? {
             directory: input.directory,
@@ -38,6 +55,7 @@ function boot(input: { directory: string; init?: () => Promise<any>; worktree?: 
               worktree: sandbox,
               project,
             }))
+    const ctx: InstanceContext = { key: input.key, configDir: input.configDir, ...base }
     await context.provide(ctx, async () => {
       await input.init?.()
     })
@@ -45,25 +63,36 @@ function boot(input: { directory: string; init?: () => Promise<any>; worktree?: 
   })
 }
 
-function track(directory: string, next: Promise<InstanceContext>) {
+function track(key: string, next: Promise<InstanceContext>) {
   const task = next.catch((error) => {
-    if (cache.get(directory) === task) cache.delete(directory)
+    if (cache.get(key) === task) cache.delete(key)
     throw error
   })
-  cache.set(directory, task)
+  cache.set(key, task)
   return task
 }
 
 export const Instance = {
-  async provide<R>(input: { directory: string; init?: () => Promise<any>; fn: () => R }): Promise<R> {
+  async provide<R>(input: {
+    directory: string
+    instanceId?: string
+    configDir?: string
+    init?: () => Promise<any>
+    fn: () => R
+  }): Promise<R> {
     const directory = Filesystem.resolve(input.directory)
-    let existing = cache.get(directory)
+    // Decouple instance identity from cwd: explicit instanceId keys the cache,
+    // otherwise fall back to the resolved directory (upstream behavior).
+    const key = input.instanceId ?? directory
+    let existing = cache.get(key)
     if (!existing) {
-      Log.Default.info("creating instance", { directory })
+      Log.Default.info("creating instance", { key, directory })
       existing = track(
-        directory,
+        key,
         boot({
+          key,
           directory,
+          configDir: input.configDir,
           init: input.init,
         }),
       )
@@ -75,6 +104,9 @@ export const Instance = {
   },
   get current() {
     return context.use()
+  },
+  get key() {
+    return context.use().key
   },
   get directory() {
     return context.use().directory
@@ -116,12 +148,20 @@ export const Instance = {
   restore<R>(ctx: InstanceContext, fn: () => R): R {
     return context.provide(ctx, fn)
   },
-  async reload(input: { directory: string; init?: () => Promise<any>; project?: Project.Info; worktree?: string }) {
+  async reload(input: {
+    directory: string
+    instanceId?: string
+    configDir?: string
+    init?: () => Promise<any>
+    project?: Project.Info
+    worktree?: string
+  }) {
     const directory = Filesystem.resolve(input.directory)
-    Log.Default.info("reloading instance", { directory })
-    await disposeInstance(directory)
-    cache.delete(directory)
-    const next = track(directory, boot({ ...input, directory }))
+    const key = input.instanceId ?? directory
+    Log.Default.info("reloading instance", { key, directory })
+    await disposeInstance(key)
+    cache.delete(key)
+    const next = track(key, boot({ ...input, key, directory }))
 
     GlobalBus.emit("event", {
       directory,
@@ -138,11 +178,12 @@ export const Instance = {
     return await next
   },
   async dispose() {
+    const key = Instance.key
     const directory = Instance.directory
     const project = Instance.project
-    Log.Default.info("disposing instance", { directory })
-    await disposeInstance(directory)
-    cache.delete(directory)
+    Log.Default.info("disposing instance", { key, directory })
+    await disposeInstance(key)
+    cache.delete(key)
 
     GlobalBus.emit("event", {
       directory,

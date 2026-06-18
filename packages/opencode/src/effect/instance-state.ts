@@ -36,6 +36,11 @@ export namespace InstanceState {
 
   export const directory = Effect.map(context, (ctx) => ctx.directory)
 
+  // ScopedCache key for per-instance state (MCP/Config/LSP/Session). Defaults to
+  // `directory` (upstream) but uses the explicit instance key when set, so many
+  // sessions sharing one desk directory get separate scopes.
+  export const key = Effect.map(context, (ctx) => ctx.key)
+
   export const make = <A, E = never, R = never>(
     init: (ctx: InstanceContext) => Effect.Effect<A, E, R | Scope.Scope>,
   ): Effect.Effect<InstanceState<A, E, Exclude<R, Scope.Scope>>, never, R | Scope.Scope> =>
@@ -61,7 +66,7 @@ export namespace InstanceState {
 
   export const get = <A, E, R>(self: InstanceState<A, E, R>) =>
     Effect.gen(function* () {
-      return yield* ScopedCache.get(self.cache, yield* directory)
+      return yield* ScopedCache.get(self.cache, yield* key)
     })
 
   export const use = <A, E, R, B>(self: InstanceState<A, E, R>, select: (value: A) => B) =>
@@ -74,11 +79,11 @@ export namespace InstanceState {
 
   export const has = <A, E, R>(self: InstanceState<A, E, R>) =>
     Effect.gen(function* () {
-      return yield* ScopedCache.has(self.cache, yield* directory)
+      return yield* ScopedCache.has(self.cache, yield* key)
     })
 
   export const invalidate = <A, E, R>(self: InstanceState<A, E, R>) =>
     Effect.gen(function* () {
-      return yield* ScopedCache.invalidate(self.cache, yield* directory)
+      return yield* ScopedCache.invalidate(self.cache, yield* key)
     })
 }
