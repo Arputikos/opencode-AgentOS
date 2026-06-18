@@ -471,6 +471,26 @@ export namespace MCP {
         Effect.catch(() => Effect.succeed([] as number[])),
       )
 
+      // Windows tree-kill: descendants() returns [] on win32 (pgrep is POSIX),
+      // so the SIGTERM-children path never reaches the MCP server's grandchildren
+      // (e.g. the Playwright browser). taskkill /T force-kills the whole process
+      // tree rooted at pid. Patches the Agent OS shared-server dispose so an
+      // instance teardown actually frees its browser on Windows.
+      const killTree = Effect.fnUntraced(function* (pid: number) {
+        if (process.platform !== "win32") return
+        yield* Effect.gen(function* () {
+          const handle = yield* spawner.spawn(
+            ChildProcess.make("taskkill", ["/F", "/T", "/PID", String(pid)], { stdin: "ignore" }),
+          )
+          yield* handle.exitCode
+        }).pipe(
+          Effect.scoped,
+          // Don't swallow silently — a failed taskkill on win32 means the MCP
+          // grandchild (e.g. Playwright browser) may leak; surface it for debug.
+          Effect.catch((cause) => Effect.sync(() => log.warn("taskkill tree-kill failed for mcp pid", { pid, cause }))),
+        )
+      })
+
       function watch(s: State, name: string, client: MCPClient, timeout?: number) {
         client.setNotificationHandler(ToolListChangedNotificationSchema, async () => {
           log.info("tools list changed notification received", { server: name })
@@ -532,11 +552,15 @@ export namespace MCP {
                   Effect.gen(function* () {
                     const pid = (client.transport as any)?.pid
                     if (typeof pid === "number") {
-                      const pids = yield* descendants(pid)
-                      for (const dpid of pids) {
-                        try {
-                          process.kill(dpid, "SIGTERM")
-                        } catch {}
+                      if (process.platform === "win32") {
+                        yield* killTree(pid)
+                      } else {
+                        const pids = yield* descendants(pid)
+                        for (const dpid of pids) {
+                          try {
+                            process.kill(dpid, "SIGTERM")
+                          } catch {}
+                        }
                       }
                     }
                     yield* Effect.tryPromise(() => client.close()).pipe(Effect.ignore)
