@@ -1,4 +1,3 @@
-import "@opentui/solid/runtime-plugin-support"
 import {
   type TuiDispose,
   type TuiPlugin,
@@ -920,6 +919,30 @@ async function installPluginBySpec(
   }
 }
 
+// Lazily register @opentui's global Bun runtime resolver plugin — and ONLY when
+// the TUI actually launches (TuiPluginRuntime.init), never on a headless
+// `opencode serve`.
+//
+// Why this must be lazy: this module is pulled into the import graph of EVERY
+// opencode command, including `serve`, via
+//   index.ts → cli/cmd/tui/{attach,thread} → ./app → ./plugin → here.
+// `@opentui/solid/runtime-plugin-support` registers a Bun resolver plugin whose
+// onResolve handler calls `import.meta.resolve()`, which Bun routes back through
+// the same plugin with no re-entry guard. Resolving a large module graph (e.g. a
+// real Next.js/TS project an agent reads via read/grep) recurses until the stack
+// overflows and the server dies with `RangeError: Maximum call stack size
+// exceeded` (exit 7). A headless server never renders a TUI, so it must never
+// register this plugin. Registering here (before load() pulls in external TUI
+// plugins) is in time for plugin resolution; host @opentui modules already
+// resolve normally via node_modules in dev and are bundled in the compiled
+// binary, so they don't depend on this. See AgentOS
+// docs/tickets/47-BUG-opentui-serve-crash-loop/.
+let runtimePluginSupportLoaded: Promise<unknown> | undefined
+function ensureRuntimePluginSupport(): Promise<unknown> {
+  runtimePluginSupportLoaded ??= import("@opentui/solid/runtime-plugin-support")
+  return runtimePluginSupportLoaded
+}
+
 export namespace TuiPluginRuntime {
   let dir = ""
   let loaded: Promise<void> | undefined
@@ -936,7 +959,7 @@ export namespace TuiPluginRuntime {
     }
 
     dir = cwd
-    loaded = load(api)
+    loaded = ensureRuntimePluginSupport().then(() => load(api))
     return loaded
   }
 
