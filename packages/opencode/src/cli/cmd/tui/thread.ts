@@ -1,5 +1,4 @@
 import { cmd } from "@/cli/cmd/cmd"
-import { tui } from "./app"
 import { Rpc } from "@/util/rpc"
 import { type rpc } from "./worker"
 import path from "path"
@@ -102,6 +101,12 @@ export const TuiThreadCommand = cmd({
         describe: "agent to use",
       }),
   handler: async (args) => {
+    // Lazy-load the TUI graph (app.tsx → @opentui/core native + @opentui/solid +
+    // solid-js + ~40 .tsx components) only when the TUI actually launches. A
+    // top-level import would pull ~375 MB RSS into EVERY command — including the
+    // headless `opencode serve` that AgentOS runs — via index.ts's static import
+    // of this command module. See AgentOS docs/tickets/51-FEATURE-serve-skip-tui-graph/.
+    const { tui } = await import("./app")
     // Keep ENABLE_PROCESSED_INPUT cleared even if other code flips it.
     // (Important when running under `bun run` wrappers on Windows.)
     const unguard = win32InstallCtrlCGuard()
