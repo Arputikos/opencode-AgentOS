@@ -1352,10 +1352,11 @@ NOTE: At any point in time through this workflow you should feel free to ask the
         const lastUser = lastUserMsg.info
         const agent = yield* agents.get(lastUser.agent)
         if (!agent) return
-        // AgentOS fork patch: prefer the agent's CURRENT model over the stale model
+        // AgentOS fork patch: prefer the CURRENT model (agent's own, else the
+        // global default = opencode.json top-level `model`) over the stale model
         // pinned on the user message (see the matching note in the main loop) so an
         // orphan-tool resume after a mid-session model edit runs on the new model.
-        const effModel = agent.model ?? lastUser.model
+        const effModel = agent.model ?? (yield* provider.defaultModel())
         const model = yield* getModel(effModel.providerID, effModel.modelID, sessionID)
         const session = yield* sessions.get(sessionID)
 
@@ -1576,16 +1577,25 @@ NOTE: At any point in time through this workflow you should feel free to ask the
             // model is unchanged or the agent has no configured model.
             {
               const liveAgent = yield* agents.get(lastUser.agent)
+              // The model this turn SHOULD run on: the agent's own model if it has
+              // one, else the global default — `config.model`, i.e. opencode.json's
+              // top-level `model`, which AgentOS rewrites to the current model on
+              // every spawn. Deliberately NOT `lastModel`: that returns the STALE
+              // pinned model of the last user message, which is exactly what we are
+              // overriding. (AgentOS configs set the model globally, not per-agent —
+              // `agent: {}` is empty — so `liveAgent.model` is undefined and the
+              // defaultModel branch is the one that actually fires.)
+              const target = liveAgent?.model ?? (yield* provider.defaultModel())
               if (
-                liveAgent?.model &&
-                (liveAgent.model.providerID !== lastUser.model.providerID ||
-                  liveAgent.model.modelID !== lastUser.model.modelID)
+                target &&
+                (target.providerID !== lastUser.model.providerID ||
+                  target.modelID !== lastUser.model.modelID)
               ) {
-                yield* slog.info("rebinding pinned user-message model to the agent's current model", {
+                yield* slog.info("rebinding pinned user-message model to the current model", {
                   from: `${lastUser.model.providerID}/${lastUser.model.modelID}`,
-                  to: `${liveAgent.model.providerID}/${liveAgent.model.modelID}`,
+                  to: `${target.providerID}/${target.modelID}`,
                 })
-                lastUser.model = { providerID: liveAgent.model.providerID, modelID: liveAgent.model.modelID }
+                lastUser.model = { providerID: target.providerID, modelID: target.modelID }
               }
             }
 
