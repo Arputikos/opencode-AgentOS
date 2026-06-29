@@ -1352,7 +1352,11 @@ NOTE: At any point in time through this workflow you should feel free to ask the
         const lastUser = lastUserMsg.info
         const agent = yield* agents.get(lastUser.agent)
         if (!agent) return
-        const model = yield* getModel(lastUser.model.providerID, lastUser.model.modelID, sessionID)
+        // AgentOS fork patch: prefer the agent's CURRENT model over the stale model
+        // pinned on the user message (see the matching note in the main loop) so an
+        // orphan-tool resume after a mid-session model edit runs on the new model.
+        const effModel = agent.model ?? lastUser.model
+        const model = yield* getModel(effModel.providerID, effModel.modelID, sessionID)
         const session = yield* sessions.get(sessionID)
 
         yield* elog.info("resumeOrphanTools", { sessionID, count: orphans.length })
@@ -1558,6 +1562,32 @@ NOTE: At any point in time through this workflow you should feel free to ask the
             }
 
             if (!lastUser) throw new Error("No user message found in stream. This should never happen.")
+
+            // AgentOS fork patch: the model is pinned onto the user message when it is
+            // created (`createUserMessage` → `ag.model`). If the agent's configured model
+            // changed afterwards (e.g. the user edited it in AgentOS settings mid-session),
+            // resuming/continuing this turn would otherwise re-run on the STALE pinned model
+            // — even though the freshly-spawned server's config carries the new one —
+            // surfacing as "Model not found: <old model>" on every retry. Re-bind to the
+            // agent's CURRENT model so model edits propagate seamlessly to existing turns
+            // (no new message, no re-prompt, no UX/AX change). This mutation is in-memory
+            // only — `msgs` is reloaded from storage on each prompt/resume, so it never
+            // persists a fake user choice; it just re-resolves every time. No-op when the
+            // model is unchanged or the agent has no configured model.
+            {
+              const liveAgent = yield* agents.get(lastUser.agent)
+              if (
+                liveAgent?.model &&
+                (liveAgent.model.providerID !== lastUser.model.providerID ||
+                  liveAgent.model.modelID !== lastUser.model.modelID)
+              ) {
+                yield* slog.info("rebinding pinned user-message model to the agent's current model", {
+                  from: `${lastUser.model.providerID}/${lastUser.model.modelID}`,
+                  to: `${liveAgent.model.providerID}/${liveAgent.model.modelID}`,
+                })
+                lastUser.model = { providerID: liveAgent.model.providerID, modelID: liveAgent.model.modelID }
+              }
+            }
 
             const lastAssistantMsg = msgs.findLast(
               (msg) => msg.info.role === "assistant" && msg.info.id === lastAssistant?.id,
