@@ -76,7 +76,12 @@ export namespace SessionRevert {
         if (session.revert?.snapshot) yield* snap.restore(session.revert.snapshot)
         yield* snap.revert(patches)
         if (rev.snapshot) rev.diff = yield* snap.diff(rev.snapshot as string)
-        const range = all.filter((msg) => msg.info.id >= rev!.messageID)
+        // Everything from the revert point onwards. Sliced by POSITION, not by an
+        // `id >=` string compare: message IDs encode time in a 48-bit field that wraps
+        // (see `id.ts`), so once a session straddles a wrap the string order stops
+        // matching chronological order and the range comes out wrong.
+        const revIdx = all.findIndex((msg) => msg.info.id === rev!.messageID)
+        const range = revIdx === -1 ? [] : all.slice(revIdx)
         const diffs = yield* summary.computeDiff({ messages: range })
         yield* storage.write(["session_diff", input.sessionID], diffs).pipe(Effect.ignore)
         yield* bus.publish(Session.Event.Diff, { sessionID: input.sessionID, diff: diffs })
@@ -109,9 +114,16 @@ export namespace SessionRevert {
         const messageID = session.revert.messageID
         const remove = [] as MessageV2.WithParts[]
         let target: MessageV2.WithParts | undefined
-        for (const msg of msgs) {
-          if (msg.info.id < messageID) continue
-          if (msg.info.id > messageID) {
+        // Locate the revert point by identity and compare POSITIONS from there — an
+        // `id <`/`id >` string compare answers "before or after?" wrongly across an ID
+        // wrap (see `id.ts`). Bailing when the message is gone is deliberate: with a
+        // missing target every message would count as "after it" and be deleted.
+        const targetIdx = msgs.findIndex((msg) => msg.info.id === messageID)
+        if (targetIdx === -1) return
+        for (let i = 0; i < msgs.length; i++) {
+          const msg = msgs[i]
+          if (i < targetIdx) continue
+          if (i > targetIdx) {
             remove.push(msg)
             continue
           }

@@ -1551,12 +1551,29 @@ NOTE: At any point in time through this workflow you should feel free to ask the
             let lastUser: MessageV2.User | undefined
             let lastAssistant: MessageV2.Assistant | undefined
             let lastFinished: MessageV2.Assistant | undefined
+            // Positions in `msgs` (which is already in chronological order). Message IDs
+            // encode time in a 48-bit field that WRAPS (~every 795 days), so comparing
+            // two IDs as strings answers "which is newer?" incorrectly for any pair that
+            // straddles a wrap — see `id.ts`. Positions in the time-ordered list are the
+            // real ordering and are immune to that.
+            let lastUserIdx = -1
+            let lastAssistantIdx = -1
+            let lastFinishedIdx = -1
             let tasks: (MessageV2.CompactionPart | MessageV2.SubtaskPart)[] = []
             for (let i = msgs.length - 1; i >= 0; i--) {
               const msg = msgs[i]
-              if (!lastUser && msg.info.role === "user") lastUser = msg.info
-              if (!lastAssistant && msg.info.role === "assistant") lastAssistant = msg.info
-              if (!lastFinished && msg.info.role === "assistant" && msg.info.finish) lastFinished = msg.info
+              if (!lastUser && msg.info.role === "user") {
+                lastUser = msg.info
+                lastUserIdx = i
+              }
+              if (!lastAssistant && msg.info.role === "assistant") {
+                lastAssistant = msg.info
+                lastAssistantIdx = i
+              }
+              if (!lastFinished && msg.info.role === "assistant" && msg.info.finish) {
+                lastFinished = msg.info
+                lastFinishedIdx = i
+              }
               if (lastUser && lastFinished) break
               const task = msg.parts.filter((part) => part.type === "compaction" || part.type === "subtask")
               if (task && !lastFinished) tasks.push(...task)
@@ -1613,7 +1630,13 @@ NOTE: At any point in time through this workflow you should feel free to ask the
               lastAssistant?.finish &&
               !["tool-calls"].includes(lastAssistant.finish) &&
               !hasToolCalls &&
-              lastUser.id < lastAssistant.id
+              // "The last assistant reply is newer than the last user message, so there
+              // is nothing to answer." Compared by POSITION, not by ID string: IDs wrap
+              // (see the note where these indices are collected), and after a wrap every
+              // new user message sorts BELOW every pre-wrap assistant message — which
+              // made this branch fire on the first step of every resumed conversation,
+              // ending the turn before the model was ever called.
+              lastUserIdx < lastAssistantIdx
             ) {
               yield* slog.info("exiting loop")
               break
@@ -1726,8 +1749,12 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                   .pipe(Effect.ignore, Effect.forkIn(scope))
 
               if (step > 1 && lastFinished) {
-                for (const m of msgs) {
-                  if (m.info.role !== "user" || m.info.id <= lastFinished.id) continue
+                for (let i = 0; i < msgs.length; i++) {
+                  const m = msgs[i]
+                  // Position, not ID string — same wrap hazard as above. Comparing IDs
+                  // here silently skipped every user message sent after a wrap, so a
+                  // mid-turn message lost its <system-reminder> framing.
+                  if (m.info.role !== "user" || i <= lastFinishedIdx) continue
                   for (const p of m.parts) {
                     if (p.type !== "text" || p.ignored || p.synthetic) continue
                     if (!p.text.trim()) continue

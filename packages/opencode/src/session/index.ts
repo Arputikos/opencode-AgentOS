@@ -548,8 +548,14 @@ export namespace Session {
         const msgs = yield* messages({ sessionID: input.sessionID })
         const idMap = new Map<string, MessageID>()
 
-        for (const msg of msgs) {
-          if (input.messageID && msg.info.id >= input.messageID) break
+        // Copy history up to (excluding) the fork point, located by identity. An
+        // `id >=` string compare would cut in the wrong place once the session spans
+        // an ID wrap (see `id.ts`); `-1` means "no fork point given / not found", in
+        // which case the whole history is copied, as before.
+        const cutoffIdx = input.messageID ? msgs.findIndex((msg) => msg.info.id === input.messageID) : -1
+        for (let i = 0; i < msgs.length; i++) {
+          const msg = msgs[i]
+          if (cutoffIdx !== -1 && i >= cutoffIdx) break
           const newID = MessageID.ascending()
           idMap.set(msg.info.id, newID)
 
