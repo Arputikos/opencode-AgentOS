@@ -550,9 +550,15 @@ export namespace Session {
 
         // Copy history up to (excluding) the fork point, located by identity. An
         // `id >=` string compare would cut in the wrong place once the session spans
-        // an ID wrap (see `id.ts`); `-1` means "no fork point given / not found", in
-        // which case the whole history is copied, as before.
+        // an ID wrap (see `id.ts`). `-1` means "no fork point given, or it is not in
+        // this session" — both copy the whole history, but only the second is a
+        // caller mistake worth surfacing, so the two cases are logged apart.
         const cutoffIdx = input.messageID ? msgs.findIndex((msg) => msg.info.id === input.messageID) : -1
+        if (input.messageID && cutoffIdx === -1)
+          log.warn("fork point not found in session — copying full history", {
+            sessionID: input.sessionID,
+            messageID: input.messageID,
+          })
         for (let i = 0; i < msgs.length; i++) {
           const msg = msgs[i]
           if (cutoffIdx !== -1 && i >= cutoffIdx) break

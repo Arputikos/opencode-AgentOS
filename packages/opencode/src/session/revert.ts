@@ -116,10 +116,19 @@ export namespace SessionRevert {
         let target: MessageV2.WithParts | undefined
         // Locate the revert point by identity and compare POSITIONS from there — an
         // `id <`/`id >` string compare answers "before or after?" wrongly across an ID
-        // wrap (see `id.ts`). Bailing when the message is gone is deliberate: with a
-        // missing target every message would count as "after it" and be deleted.
+        // wrap (see `id.ts`).
         const targetIdx = msgs.findIndex((msg) => msg.info.id === messageID)
-        if (targetIdx === -1) return
+        if (targetIdx === -1) {
+          // The revert target is gone (already removed, or the session was rewritten
+          // underneath us). Deleting is not an option — with no target every message
+          // would count as "after it" and the whole history would go. But leaving the
+          // revert marker in place is not either: `cleanup` runs on every turn, so a
+          // marker that can never be resolved would keep the session pinned in a
+          // reverted state forever. Drop the marker and carry on.
+          log.warn("revert target missing — clearing stale revert marker", { sessionID, messageID })
+          yield* sessions.clearRevert(sessionID)
+          return
+        }
         for (let i = 0; i < msgs.length; i++) {
           const msg = msgs[i]
           if (i < targetIdx) continue
