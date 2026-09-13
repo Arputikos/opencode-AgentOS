@@ -357,39 +357,92 @@ function waitForOAuthCallback(pkce: PkceCodes, state: string): Promise<TokenResp
   })
 }
 
+/**
+ * Which OpenAI models a ChatGPT (Codex OAuth) subscription may call.
+ *
+ * A frozen allow-list of model IDs is unmaintainable: OpenAI ships new models
+ * every few weeks and retires old ones on published dates (gpt-5.4 and
+ * gpt-5.4-mini left Codex on 2026-08-31). A stale list fails in BOTH directions
+ * — it blocks models that work ("Model not found: openai/<id>", the request
+ * never leaves the machine) and admits models the backend already refuses
+ * ("The '<id>' model is not supported when using Codex with a ChatGPT account").
+ *
+ * So the rule is by version, not by name: Codex entitlement tracks the model
+ * generation, and anything newer than gpt-5.4 has been in scope since the 5.5
+ * rollout. New models are admitted the day models.dev lists them, with no code
+ * change here. Ported from upstream opencode (`plugin/openai/codex.ts`,
+ * v1.18.29) so it disappears cleanly when the fork is rebased onto a newer tag.
+ *
+ * The backend stays the final authority — a model that passes this filter can
+ * still be refused for a given account or plan. That refusal is surfaced to the
+ * operator as a terminal, non-retryable error rather than being guessed at here.
+ */
+const CODEX_ALLOWED_MODELS = new Set(["gpt-5.5", "gpt-5.3-codex-spark", "gpt-5.4", "gpt-5.4-mini"])
+const CODEX_DISALLOWED_MODELS = new Set(["gpt-5.5-pro", "gpt-5.6"])
+
+export function isCodexOauthModel(model: { api: { id: string }; options?: Record<string, unknown> }): boolean {
+  const id = model.api.id
+
+  // `pro` reasoning variants are billed outside the subscription. `options` is
+  // an open record here (v1.4.6 does not populate `reasoningMode` yet), so the
+  // ID suffix is what actually catches them today; the field check keeps the
+  // rule correct once a newer upstream starts setting it.
+  if (model.options?.["reasoningMode"] === "pro") return false
+  if (id.endsWith("-pro")) return false
+
+  if (CODEX_ALLOWED_MODELS.has(id)) return true
+  if (CODEX_DISALLOWED_MODELS.has(id)) return false
+
+  const match = id.match(/^gpt-(\d+)(?:\.(\d+))?/)
+  if (!match) return false
+  const major = Number(match[1])
+  const minor = Number(match[2] ?? 0)
+  return major > 5 || (major === 5 && minor > 4)
+}
+
+/**
+ * Context window as the Codex backend actually enforces it.
+ *
+ * models.dev reports the limit of the public **API** (gpt-5.6-luna: 1 050 000),
+ * which is far larger than what Codex grants a ChatGPT subscription. Left
+ * uncorrected, the session believes it has 2.6x the room it really has, never
+ * compacts pre-emptively, and only finds out via a 400 `context_length_exceeded`
+ * mid-turn.
+ */
+export function codexContextLimit<T extends { id: string; limit: { context: number; input?: number; output: number } }>(
+  model: T,
+): T["limit"] {
+  if (!model.id.includes("gpt-5.5") && !model.id.includes("gpt-5.6")) return model.limit
+  return { context: 400_000, input: 272_000, output: 128_000 }
+}
+
 export async function CodexAuthPlugin(input: PluginInput): Promise<Hooks> {
   return {
+    provider: {
+      id: "openai",
+      async models(provider, ctx) {
+        if (ctx.auth?.type !== "oauth") return provider.models
+
+        return Object.fromEntries(
+          Object.entries(provider.models)
+            .filter(([, model]) => isCodexOauthModel(model))
+            .map(([modelID, model]) => [
+              modelID,
+              {
+                ...model,
+                // Included with the ChatGPT subscription — never billed per token.
+                cost: { input: 0, output: 0, cache: { read: 0, write: 0 } },
+                limit: codexContextLimit(model),
+              },
+            ]),
+        )
+      },
+    },
     auth: {
       provider: "openai",
-      async loader(getAuth, provider) {
+      async loader(getAuth) {
         const auth = await getAuth()
         if (auth.type !== "oauth") return {}
-
-        // Filter models to only allowed Codex models for OAuth
-        const allowedModels = new Set([
-          "gpt-5.1-codex",
-          "gpt-5.1-codex-max",
-          "gpt-5.1-codex-mini",
-          "gpt-5.2",
-          "gpt-5.2-codex",
-          "gpt-5.3-codex",
-          "gpt-5.4",
-          "gpt-5.4-mini",
-        ])
-        for (const [modelId, model] of Object.entries(provider.models)) {
-          if (modelId.includes("codex")) continue
-          if (allowedModels.has(model.api.id)) continue
-          delete provider.models[modelId]
-        }
-
-        // Zero out costs for Codex (included with ChatGPT subscription)
-        for (const model of Object.values(provider.models)) {
-          model.cost = {
-            input: 0,
-            output: 0,
-            cache: { read: 0, write: 0 },
-          }
-        }
 
         return {
           apiKey: OAUTH_DUMMY_KEY,
