@@ -175,6 +175,7 @@ function fake(
     updateToolCall: Effect.fn("TestSessionProcessor.updateToolCall")(() => Effect.succeed(undefined)),
     completeToolCall: Effect.fn("TestSessionProcessor.completeToolCall")(() => Effect.void),
     process: Effect.fn("TestSessionProcessor.process")(() => Effect.succeed(result)),
+    overflowRejected: false,
   } satisfies SessionProcessorModule.SessionProcessor.Handle
 }
 
@@ -974,7 +975,68 @@ describe("session.compaction.process", () => {
           expect(result).toBe("continue")
           expect(last?.info.role).toBe("user")
           if (last?.parts[0]?.type === "text") {
-            expect(last.parts[0].text).toContain("previous request exceeded the provider's size limit")
+            // No attachment was ever in this session, so the guidance must not
+            // claim one was removed — it used to say "due to large media
+            // attachments" for every overflow, which sent the agent off
+            // apologising for images that never existed.
+            expect(last.parts[0].text).toContain("exceeded this model's context window")
+            expect(last.parts[0].text).toContain("No attachments were involved")
+            expect(last.parts[0].text).not.toContain("media")
+          }
+        } finally {
+          await rt.dispose()
+        }
+      },
+    })
+  })
+
+  test("overflow guidance mentions media only when the history actually carried media", async () => {
+    await using tmp = await tmpdir()
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const session = await svc.create({})
+        await user(session.id, "earlier")
+        const msg = await user(session.id, "current")
+
+        const rt = runtime("continue", Plugin.defaultLayer, wide())
+        try {
+          const msgs = await svc.messages({ sessionID: session.id })
+          // Same call as the test above, but with a media part in the history.
+          const withMedia = msgs.map((m, i) =>
+            i === 0
+              ? {
+                  ...m,
+                  parts: [
+                    ...m.parts,
+                    {
+                      id: PartID.ascending(),
+                      messageID: m.info.id,
+                      sessionID: session.id,
+                      type: "file" as const,
+                      mime: "image/png",
+                      filename: "screenshot.png",
+                      url: "data:image/png;base64,AAAA",
+                    },
+                  ],
+                }
+              : m,
+          )
+          await rt.runPromise(
+            SessionCompaction.Service.use((svc) =>
+              svc.process({
+                parentID: msg.id,
+                messages: withMedia as typeof msgs,
+                sessionID: session.id,
+                auto: true,
+                overflow: true,
+              }),
+            ),
+          )
+
+          const last = (await svc.messages({ sessionID: session.id })).at(-1)
+          if (last?.parts[0]?.type === "text") {
+            expect(last.parts[0].text).toContain("media files were removed from context")
           }
         } finally {
           await rt.dispose()

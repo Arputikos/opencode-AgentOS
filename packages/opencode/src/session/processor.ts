@@ -31,6 +31,19 @@ export namespace SessionProcessor {
 
   export interface Handle {
     readonly message: MessageV2.Assistant
+    /**
+     * True when the LAST step ended because the provider refused the request as
+     * too large (`ContextOverflowError`), as opposed to our own pre-emptive
+     * token accounting deciding a compaction is due.
+     *
+     * The two look identical downstream (`process()` returns `"compact"` for
+     * both) but mean opposite things: pre-emptive compaction is routine and
+     * always shrinks the next request, while a provider rejection means the
+     * request that was actually sent did not fit — and if the excess is not in
+     * the conversation, compacting it changes nothing and the next attempt is
+     * rejected the same way. The caller needs the distinction to stop looping.
+     */
+    readonly overflowRejected: boolean
     readonly updateToolCall: (
       toolCallID: string,
       update: (part: MessageV2.ToolPart) => MessageV2.ToolPart,
@@ -70,6 +83,7 @@ export namespace SessionProcessor {
     snapshot: string | undefined
     blocked: boolean
     needsCompaction: boolean
+    overflowRejected: boolean
     currentText: MessageV2.TextPart | undefined
     reasoningMap: Record<string, MessageV2.ReasoningPart>
   }
@@ -120,6 +134,7 @@ export namespace SessionProcessor {
           snapshot: initialSnapshot,
           blocked: false,
           needsCompaction: false,
+          overflowRejected: false,
           currentText: undefined,
           reasoningMap: {},
         }
@@ -524,6 +539,7 @@ export namespace SessionProcessor {
           const error = parse(e)
           if (MessageV2.ContextOverflowError.isInstance(error)) {
             ctx.needsCompaction = true
+            ctx.overflowRejected = true
             yield* bus.publish(Session.Event.Error, { sessionID: ctx.sessionID, error })
             return
           }
@@ -538,6 +554,7 @@ export namespace SessionProcessor {
         const process = Effect.fn("SessionProcessor.process")(function* (streamInput: LLM.StreamInput) {
           slog.info("process")
           ctx.needsCompaction = false
+          ctx.overflowRejected = false
           ctx.shouldBreak = (yield* config.get()).experimental?.continue_loop_on_deny !== true
 
           return yield* Effect.gen(function* () {
@@ -608,6 +625,9 @@ export namespace SessionProcessor {
         return {
           get message() {
             return ctx.assistantMessage
+          },
+          get overflowRejected() {
+            return ctx.overflowRejected
           },
           updateToolCall,
           completeToolCall,

@@ -67,6 +67,40 @@ export namespace SessionPrompt {
   const log = Log.create({ service: "session.prompt" })
   const elog = EffectLogger.create({ service: "session.prompt" })
 
+  /**
+   * Patched (agentos): how many provider "request too large" rejections in a row
+   * may be answered with a compaction before the turn gives up.
+   *
+   * 1 would be wrong — a single rejection followed by one compaction is normal
+   * recovery and usually works. 2 is the smallest value that distinguishes
+   * "compaction fixed it" from "compaction is irrelevant to what overflowed":
+   * if the request is refused again immediately after a compaction, the excess
+   * is not in the conversation history and no further compaction will change
+   * that.
+   */
+  const COMPACTION_REJECT_LIMIT = 2
+
+  /**
+   * Patched (agentos): advance the overflow-compaction circuit breaker.
+   *
+   * `rejected` is true when the provider refused the request as too large
+   * (`ContextOverflowError`), false when our own token accounting decided a
+   * compaction was due. Only the former can loop: a rejection is answered with
+   * a compaction, and if the excess was never in the conversation the next
+   * request is rejected identically, forever.
+   *
+   * Returns the new consecutive count and whether to give up instead of
+   * compacting again.
+   */
+  export function nextOverflowCompaction(input: { rejected: boolean; consecutive: number }): {
+    consecutive: number
+    giveUp: boolean
+  } {
+    if (!input.rejected) return { consecutive: 0, giveUp: false }
+    const consecutive = input.consecutive + 1
+    return { consecutive, giveUp: consecutive >= COMPACTION_REJECT_LIMIT }
+  }
+
   export interface Interface {
     readonly cancel: (sessionID: SessionID) => Effect.Effect<void>
     readonly prompt: (input: PromptInput) => Effect.Effect<MessageV2.WithParts>
@@ -1532,6 +1566,10 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           // the structured-output corrective retry loop to `format.retryCount`.
           let structuredAttempts = 0
           let step = 0
+          // Patched (agentos): consecutive compactions triggered by the provider
+          // REFUSING the request as too large. Reset by any step the provider
+          // actually accepted. See COMPACTION_REJECT_LIMIT below.
+          let overflowCompactions = 0
           const session = yield* sessions.get(sessionID)
 
           // Patched (agentos/v1.4.6.3): re-drive any orphaned tool parts whose
@@ -1834,13 +1872,62 @@ NOTE: At any point in time through this workflow you should feel free to ask the
 
               if (result === "stop") return "break" as const
               if (result === "compact") {
+                // Patched (agentos): stop the compaction doom loop.
+                //
+                // `"compact"` means one of two very different things. Either our
+                // own token accounting decided a compaction is due (routine — the
+                // next request is genuinely smaller), or the provider REFUSED the
+                // request as too large. In the second case compaction only helps
+                // if the excess is in the conversation. When it is not — tool
+                // schemas, system prompt, or simply a context window smaller than
+                // advertised — every compacted retry is rejected identically and
+                // the loop never terminates. Observed in production: 8 compactions
+                // in 45 seconds, ended only by the operator aborting the session.
+                //
+                // One rejection followed by a compaction is legitimate recovery.
+                // A second rejection right after proves compaction is not the
+                // remedy, so fail with something the operator can act on instead
+                // of burning their quota.
+                {
+                  const next = nextOverflowCompaction({
+                    rejected: handle.overflowRejected,
+                    consecutive: overflowCompactions,
+                  })
+                  overflowCompactions = next.consecutive
+                  if (next.giveUp) {
+                    const used = handle.message.tokens
+                    handle.message.error = new MessageV2.ContextOverflowError({
+                      message:
+                        `The provider rejected this request as too large ${overflowCompactions} times in a row, ` +
+                        `and compacting the conversation did not help — so the excess is not in the ` +
+                        `conversation history. Likely causes: too many tools/MCP servers for this model's ` +
+                        `context window, or a model whose real context window is smaller than advertised. ` +
+                        `Model ${lastUser.model.providerID}/${lastUser.model.modelID}, ` +
+                        `context limit ${model.limit.context}, ` +
+                        `last measured usage ${used.input + used.output + used.cache.read + used.cache.write} tokens, ` +
+                        `${Object.keys(tools).length} tools enabled.`,
+                    }).toObject()
+                    handle.message.finish = "error"
+                    yield* sessions.updateMessage(handle.message)
+                    return "break" as const
+                  }
+                }
                 yield* compaction.create({
                   sessionID,
                   agent: lastUser.agent,
                   model: lastUser.model,
                   auto: true,
-                  overflow: !handle.message.finish,
+                  // Ask the processor directly whether the provider refused the
+                  // request, instead of inferring it from a missing finish
+                  // reason. `halt()` returns early on ContextOverflowError
+                  // without setting `finish`, so `!handle.message.finish` did
+                  // pick out the same cases — but only by accident of control
+                  // flow, and it silently broke the moment anything else
+                  // returned "compact" without a finish reason.
+                  overflow: handle.overflowRejected,
                 })
+              } else {
+                overflowCompactions = 0
               }
               return "continue" as const
             }).pipe(Effect.ensuring(instruction.clear(handle.message.id)))

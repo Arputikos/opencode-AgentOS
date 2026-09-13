@@ -30,6 +30,42 @@ export namespace SessionCompaction {
     ),
   }
 
+  /**
+   * Patched (agentos): the synthetic "carry on" prompt injected after an
+   * automatic compaction.
+   *
+   * The overflow variant used to assert, unconditionally, that the request
+   * "exceeded the provider's size limit due to large media attachments" and
+   * that "media files were removed from context". Neither half is reliably
+   * true: media is only ever stripped on the `replay` path, and this prompt is
+   * injected on the path where there is nothing to replay. Sessions that hit it
+   * in production carried no attachments at all, so the agent was instructed to
+   * apologise to the user for oversized images that never existed — and the
+   * operator was pointed at a cause that had nothing to do with the failure.
+   *
+   * Claim media only when the compacted history actually carried media;
+   * otherwise say what is known and name the causes that a compaction cannot
+   * fix.
+   */
+  export function continuePrompt(input: { overflow: boolean; hadMedia: boolean }): string {
+    const tail = "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed."
+    if (!input.overflow) return tail
+    if (input.hadMedia)
+      return (
+        "The previous request exceeded the provider's size limit. The conversation was compacted and media files " +
+        "were removed from context. If the user was asking about attached images or files, explain that the " +
+        "attachments were too large to process and suggest they try again with smaller or fewer files.\n\n" +
+        tail
+      )
+    return (
+      "The previous request exceeded this model's context window, so the conversation was compacted. No " +
+      "attachments were involved. If the request keeps failing, the size is coming from something other than the " +
+      "conversation — typically the number of enabled tools/MCP servers, or a model whose context window is too " +
+      "small for this session.\n\n" +
+      tail
+    )
+  }
+
   export const PRUNE_MINIMUM = 20_000
   export const PRUNE_PROTECT = 40_000
   const PRUNE_PROTECTED_TOOLS = ["skill"]
@@ -335,11 +371,12 @@ When constructing the summary, try to stick to this template:
                 agent: userMessage.agent,
                 model: userMessage.model,
               })
-              const text =
-                (input.overflow
-                  ? "The previous request exceeded the provider's size limit due to large media attachments. The conversation was compacted and media files were removed from context. If the user was asking about attached images or files, explain that the attachments were too large to process and suggest they try again with smaller or fewer files.\n\n"
-                  : "") +
-                "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed."
+              const text = continuePrompt({
+                overflow: input.overflow === true,
+                hadMedia: input.messages.some((m) =>
+                  m.parts.some((p) => p.type === "file" && MessageV2.isMedia(p.mime)),
+                ),
+              })
               yield* session.updatePart({
                 id: PartID.ascending(),
                 messageID: continueMsg.id,
