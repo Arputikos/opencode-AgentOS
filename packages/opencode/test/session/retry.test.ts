@@ -27,6 +27,13 @@ function wrap(message: unknown): ReturnType<NamedError["toObject"]> {
 }
 
 describe("session.retry.delay", () => {
+  test("identifies provider retry hints separately from local backoff", () => {
+    expect(SessionRetry.hasRetryAfter(apiError({ "retry-after-ms": "1500" }))).toBe(true)
+    expect(SessionRetry.hasRetryAfter(apiError({ "retry-after": "30" }))).toBe(true)
+    expect(SessionRetry.hasRetryAfter(apiError({ "retry-after": "invalid" }))).toBe(false)
+    expect(SessionRetry.hasRetryAfter(apiError())).toBe(false)
+  })
+
   test("caps delay at 30 seconds when headers missing", () => {
     const error = apiError()
     const delays = Array.from({ length: 10 }, (_, index) => SessionRetry.delay(index + 1, error))

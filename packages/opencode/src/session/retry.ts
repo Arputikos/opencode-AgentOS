@@ -52,6 +52,20 @@ export namespace SessionRetry {
     return cap(Math.min(RETRY_INITIAL_DELAY * Math.pow(RETRY_BACKOFF_FACTOR, attempt - 1), RETRY_MAX_DELAY_NO_HEADERS))
   }
 
+  /** Whether a valid provider retry hint, rather than local exponential backoff,
+   * determined the next retry timestamp. */
+  export function hasRetryAfter(error?: MessageV2.APIError) {
+    const headers = error?.data.responseHeaders
+    if (!headers) return false
+    const ms = headers["retry-after-ms"]
+    if (ms && Number.isFinite(Number.parseFloat(ms)) && Number.parseFloat(ms) > 0) return true
+    const value = headers["retry-after"]
+    if (!value) return false
+    const seconds = Number.parseFloat(value)
+    if (Number.isFinite(seconds) && seconds > 0) return true
+    return Number.isFinite(Date.parse(value)) && Date.parse(value) > Date.now()
+  }
+
   export function retryable(error: Err) {
     // context overflow errors should not be retried
     if (MessageV2.ContextOverflowError.isInstance(error)) return undefined
@@ -103,7 +117,7 @@ export namespace SessionRetry {
 
   export function policy(opts: {
     parse: (error: unknown) => Err
-    set: (input: { attempt: number; message: string; next: number }) => Effect.Effect<void>
+    set: (input: { attempt: number; message: string; next: number; retryAfter: boolean }) => Effect.Effect<void>
   }) {
     return Schedule.fromStepWithMetadata(
       Effect.succeed((meta: Schedule.InputMetadata<unknown>) => {
@@ -113,7 +127,12 @@ export namespace SessionRetry {
         return Effect.gen(function* () {
           const wait = delay(meta.attempt, MessageV2.APIError.isInstance(error) ? error : undefined)
           const now = yield* Clock.currentTimeMillis
-          yield* opts.set({ attempt: meta.attempt, message, next: now + wait })
+          yield* opts.set({
+            attempt: meta.attempt,
+            message,
+            next: now + wait,
+            retryAfter: hasRetryAfter(MessageV2.APIError.isInstance(error) ? error : undefined),
+          })
           return [meta.attempt, Duration.millis(wait)] as [number, Duration.Duration]
         })
       }),

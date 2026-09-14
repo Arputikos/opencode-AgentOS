@@ -339,6 +339,7 @@ export type SessionStatus =
       attempt: number
       message: string
       next: number
+      retryAfter: boolean
     }
   | {
       type: "busy"

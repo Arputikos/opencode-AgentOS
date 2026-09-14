@@ -609,6 +609,7 @@ export namespace SessionProcessor {
                       attempt: info.attempt,
                       message: info.message,
                       next: info.next,
+                      retryAfter: info.retryAfter,
                     }),
                 }),
               ),

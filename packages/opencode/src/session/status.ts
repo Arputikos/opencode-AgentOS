@@ -16,6 +16,8 @@ export namespace SessionStatus {
         attempt: z.number(),
         message: z.string(),
         next: z.number(),
+        /** True only when `next` comes from the provider's Retry-After header. */
+        retryAfter: z.boolean(),
       }),
       z.object({
         type: z.literal("busy"),
