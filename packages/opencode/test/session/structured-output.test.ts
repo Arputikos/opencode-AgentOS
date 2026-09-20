@@ -157,10 +157,21 @@ describe("structured-output.AssistantMessage", () => {
 })
 
 describe("structured-output.createStructuredOutputTool", () => {
+  // Patched (agentos): the tool is a PASS-THROUGH. Validation, the corrective
+  // retry budget and the failure all live in the Agent OS orchestrator, so the
+  // fork is only responsible for two things — showing the model the caller's
+  // real JSON Schema, and relaying the orchestrator's verdict back. The
+  // validation behaviour these tests used to assert is covered by the
+  // orchestrator's own suite (`core/__tests__/structured-output.test.ts`).
+  const accept = async () => ({ accepted: true, text: "Structured output captured successfully." })
+  const reject = async () => ({ accepted: false, text: "did NOT match the required schema" })
+  const callOpts = { toolCallId: "test-call-id", messages: [], abortSignal: undefined as any }
+
   test("creates tool with correct id", () => {
     const tool = SessionPrompt.createStructuredOutputTool({
       schema: { type: "object", properties: { name: { type: "string" } } },
-      onSuccess: () => {},
+      submit: accept,
+      onAccepted: () => {},
     })
 
     // AI SDK tool type doesn't expose id, but we set it internally
@@ -170,249 +181,105 @@ describe("structured-output.createStructuredOutputTool", () => {
   test("creates tool with description", () => {
     const tool = SessionPrompt.createStructuredOutputTool({
       schema: { type: "object" },
-      onSuccess: () => {},
+      submit: accept,
+      onAccepted: () => {},
     })
 
     expect(tool.description).toContain("structured format")
   })
 
-  test("creates tool with schema as inputSchema", () => {
+  test("hands the model the caller's schema verbatim as inputSchema", () => {
     const schema = {
       type: "object",
       properties: {
         company: { type: "string" },
         founded: { type: "number" },
+        tags: { type: "array", items: { type: "string" } },
+        user: { type: "object", properties: { name: { type: "string" } }, required: ["name"] },
       },
       required: ["company"],
     }
 
     const tool = SessionPrompt.createStructuredOutputTool({
       schema,
-      onSuccess: () => {},
+      submit: accept,
+      onAccepted: () => {},
     })
 
-    // AI SDK wraps schema in { jsonSchema: {...} }
-    expect(tool.inputSchema).toBeDefined()
+    // This is the one thing only the fork can do: the pass-through `jsonSchema()`
+    // bypasses the zod-only tool registry, so oneOf/$ref/nested shapes survive.
     const inputSchema = tool.inputSchema as any
     expect(inputSchema.jsonSchema?.properties?.company).toBeDefined()
-    expect(inputSchema.jsonSchema?.properties?.founded).toBeDefined()
+    expect(inputSchema.jsonSchema?.properties?.founded?.type).toBe("number")
+    expect(inputSchema.jsonSchema?.properties?.tags?.items?.type).toBe("string")
+    expect(inputSchema.jsonSchema?.properties?.user?.required).toContain("name")
+    expect(inputSchema.jsonSchema?.required).toContain("company")
   })
 
   test("strips $schema property from inputSchema", () => {
-    const schema = {
-      $schema: "http://json-schema.org/draft-07/schema#",
-      type: "object",
-      properties: { name: { type: "string" } },
-    }
-
     const tool = SessionPrompt.createStructuredOutputTool({
-      schema,
-      onSuccess: () => {},
+      schema: {
+        $schema: "http://json-schema.org/draft-07/schema#",
+        type: "object",
+        properties: { name: { type: "string" } },
+      },
+      submit: accept,
+      onAccepted: () => {},
     })
 
-    // AI SDK wraps schema in { jsonSchema: {...} }
     const inputSchema = tool.inputSchema as any
     expect(inputSchema.jsonSchema?.$schema).toBeUndefined()
   })
 
-  test("execute calls onSuccess with valid args", async () => {
-    let capturedOutput: unknown
+  test("execute submits the model's argument verbatim and reports acceptance", async () => {
+    let submitted: unknown
+    let accepted = false
 
     const tool = SessionPrompt.createStructuredOutputTool({
       schema: { type: "object", properties: { name: { type: "string" } } },
-      onSuccess: (output) => {
-        capturedOutput = output
+      submit: async (args) => {
+        submitted = args
+        return { accepted: true, text: "Structured output captured successfully." }
+      },
+      onAccepted: () => {
+        accepted = true
       },
     })
 
-    expect(tool.execute).toBeDefined()
-    const testArgs = { name: "Test Company" }
-    const result = await tool.execute!(testArgs, {
-      toolCallId: "test-call-id",
-      messages: [],
-      abortSignal: undefined as any,
-    })
+    const testArgs = { name: "Test Company", nested: { deep: [1, 2, 3] } }
+    const result = await tool.execute!(testArgs, callOpts)
 
-    expect(capturedOutput).toEqual(testArgs)
+    expect(submitted).toEqual(testArgs)
+    expect(accepted).toBe(true)
     expect(result.output).toBe("Structured output captured successfully.")
     expect(result.metadata.valid).toBe(true)
   })
 
-  test("execute rejects schema-violating args (enum), calls onInvalid not onSuccess", async () => {
-    let successCalled = false
-    let invalidErrors: string | undefined
+  test("a rejected submission returns the orchestrator's text and does NOT end the turn", async () => {
+    let accepted = false
 
     const tool = SessionPrompt.createStructuredOutputTool({
-      schema: {
-        type: "object",
-        additionalProperties: false,
-        required: ["sentiment"],
-        properties: { sentiment: { type: "string", enum: ["positive", "negative"] } },
-      },
-      onSuccess: () => {
-        successCalled = true
-      },
-      onInvalid: (errors) => {
-        invalidErrors = errors
+      schema: { type: "object", required: ["sentiment"] },
+      submit: reject,
+      onAccepted: () => {
+        accepted = true
       },
     })
 
-    const result = await tool.execute!(
-      { sentiment: "banana", extra: 1 },
-      { toolCallId: "test-call-id", messages: [], abortSignal: undefined as any },
-    )
+    const result = await tool.execute!({ sentiment: "banana" }, callOpts)
 
-    expect(successCalled).toBe(false)
-    expect(invalidErrors).toBeDefined()
+    // `onAccepted` is what breaks the run loop — a rejection must leave the
+    // model free to correct itself on the next step.
+    expect(accepted).toBe(false)
     expect(result.metadata.valid).toBe(false)
     expect(result.output).toContain("did NOT match the required schema")
-  })
-
-  test("execute rejects missing required field", async () => {
-    let successCalled = false
-    const tool = SessionPrompt.createStructuredOutputTool({
-      schema: { type: "object", required: ["name", "age"], properties: { name: { type: "string" }, age: { type: "number" } } },
-      onSuccess: () => {
-        successCalled = true
-      },
-    })
-    const result = await tool.execute!(
-      { name: "only name" },
-      { toolCallId: "test-call-id", messages: [], abortSignal: undefined as any },
-    )
-    expect(successCalled).toBe(false)
-    expect(result.metadata.valid).toBe(false)
-  })
-
-  test("schema is exposed as inputSchema - missing required field", async () => {
-    // Note: The AI SDK validates the input against the schema BEFORE calling execute()
-    // So invalid inputs never reach the tool's execute function
-    // This test documents the expected schema behavior
-    const tool = SessionPrompt.createStructuredOutputTool({
-      schema: {
-        type: "object",
-        properties: {
-          name: { type: "string" },
-          age: { type: "number" },
-        },
-        required: ["name", "age"],
-      },
-      onSuccess: () => {},
-    })
-
-    // The schema requires both 'name' and 'age'
-    expect(tool.inputSchema).toBeDefined()
-    const inputSchema = tool.inputSchema as any
-    expect(inputSchema.jsonSchema?.required).toContain("name")
-    expect(inputSchema.jsonSchema?.required).toContain("age")
-  })
-
-  test("schema is exposed as inputSchema - number type", async () => {
-    // The schema is handed to the model as the tool's inputSchema; runtime
-    // enforcement happens inside execute() via @cfworker/json-schema (see the
-    // "execute rejects …" tests above).
-    const tool = SessionPrompt.createStructuredOutputTool({
-      schema: {
-        type: "object",
-        properties: {
-          count: { type: "number" },
-        },
-        required: ["count"],
-      },
-      onSuccess: () => {},
-    })
-
-    // The schema defines 'count' as a number
-    expect(tool.inputSchema).toBeDefined()
-    const inputSchema = tool.inputSchema as any
-    expect(inputSchema.jsonSchema?.properties?.count?.type).toBe("number")
-  })
-
-  test("execute handles nested objects", async () => {
-    let capturedOutput: unknown
-
-    const tool = SessionPrompt.createStructuredOutputTool({
-      schema: {
-        type: "object",
-        properties: {
-          user: {
-            type: "object",
-            properties: {
-              name: { type: "string" },
-              email: { type: "string" },
-            },
-            required: ["name"],
-          },
-        },
-        required: ["user"],
-      },
-      onSuccess: (output) => {
-        capturedOutput = output
-      },
-    })
-
-    // Valid nested object - AI SDK validates before calling execute()
-    const validResult = await tool.execute!(
-      { user: { name: "John", email: "john@test.com" } },
-      {
-        toolCallId: "test-call-id",
-        messages: [],
-        abortSignal: undefined as any,
-      },
-    )
-
-    expect(capturedOutput).toEqual({ user: { name: "John", email: "john@test.com" } })
-    expect(validResult.metadata.valid).toBe(true)
-
-    // Verify schema has correct nested structure
-    const inputSchema = tool.inputSchema as any
-    expect(inputSchema.jsonSchema?.properties?.user?.type).toBe("object")
-    expect(inputSchema.jsonSchema?.properties?.user?.properties?.name?.type).toBe("string")
-    expect(inputSchema.jsonSchema?.properties?.user?.required).toContain("name")
-  })
-
-  test("execute handles arrays", async () => {
-    let capturedOutput: unknown
-
-    const tool = SessionPrompt.createStructuredOutputTool({
-      schema: {
-        type: "object",
-        properties: {
-          tags: {
-            type: "array",
-            items: { type: "string" },
-          },
-        },
-        required: ["tags"],
-      },
-      onSuccess: (output) => {
-        capturedOutput = output
-      },
-    })
-
-    // Valid array - AI SDK validates before calling execute()
-    const validResult = await tool.execute!(
-      { tags: ["a", "b", "c"] },
-      {
-        toolCallId: "test-call-id",
-        messages: [],
-        abortSignal: undefined as any,
-      },
-    )
-
-    expect(capturedOutput).toEqual({ tags: ["a", "b", "c"] })
-    expect(validResult.metadata.valid).toBe(true)
-
-    // Verify schema has correct array structure
-    const inputSchema = tool.inputSchema as any
-    expect(inputSchema.jsonSchema?.properties?.tags?.type).toBe("array")
-    expect(inputSchema.jsonSchema?.properties?.tags?.items?.type).toBe("string")
   })
 
   test("toModelOutput returns text value", async () => {
     const tool = SessionPrompt.createStructuredOutputTool({
       schema: { type: "object" },
-      onSuccess: () => {},
+      submit: accept,
+      onAccepted: () => {},
     })
 
     expect(tool.toModelOutput).toBeDefined()
@@ -430,8 +297,4 @@ describe("structured-output.createStructuredOutputTool", () => {
     if (modelOutput.type !== "text") throw new Error("expected text model output")
     expect(modelOutput.value).toBe("Test output")
   })
-
-  // Note: Retry behavior is handled by the AI SDK and the prompt loop, not the tool itself
-  // The tool simply calls onSuccess when execute() is called with valid args
-  // See prompt.ts loop() for actual retry logic
 })

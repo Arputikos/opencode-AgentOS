@@ -10,7 +10,6 @@ import { Agent } from "../agent/agent"
 import { Provider } from "../provider/provider"
 import { ModelID, ProviderID } from "../provider/schema"
 import { type Tool as AITool, tool, jsonSchema, type ToolExecutionOptions, asSchema } from "ai"
-import { Validator } from "@cfworker/json-schema"
 import { SessionCompaction } from "./compaction"
 import { Bus } from "../bus"
 import { ProviderTransform } from "../provider/transform"
@@ -62,6 +61,66 @@ IMPORTANT:
 - This tool provides your final answer - no further actions are taken after calling it`
 
 const STRUCTURED_OUTPUT_SYSTEM_PROMPT = `IMPORTANT: The user has requested structured output. You MUST use the StructuredOutput tool to provide your final response. Do NOT respond with plain text - you MUST call the StructuredOutput tool with your answer formatted according to the schema.`
+
+/**
+ * Patched (agentos): what the Agent OS orchestrator says about a submitted
+ * structured answer. `text` is written for the MODEL to read, not for a log.
+ */
+export interface StructuredSubmitResult {
+  accepted: boolean
+  text: string
+}
+
+/**
+ * Patched (agentos): hand the model's structured answer to the orchestrator and
+ * return its verdict.
+ *
+ * The orchestrator owns the schema, the validation, the corrective-retry budget
+ * and the transcript stamp for BOTH Agent OS engines, so this fork only relays.
+ * It is the same endpoint the Claude Code MCP tool posts to, which is what makes
+ * one `output_schema` behave identically on either engine.
+ *
+ * Fail-CLOSED on purpose: no orchestrator in the environment, or an
+ * unreachable one, produces a rejection the model can see rather than a silent
+ * "accepted" that nothing ever validated. A structured answer nobody checked is
+ * exactly the quiet degradation this design removes.
+ */
+async function reportStructuredOutput(sessionID: string, args: unknown): Promise<StructuredSubmitResult> {
+  const baseUrl = process.env["AGENT_OS_ORCHESTRATOR_URL"]
+  const apiKey = process.env["AGENT_OS_ORCHESTRATOR_API_KEY"]
+  if (!baseUrl || !apiKey) {
+    return {
+      accepted: false,
+      text:
+        "Structured output could not be delivered: this OpenCode server is not connected to an Agent OS " +
+        "orchestrator, so the answer cannot be validated. Stop calling StructuredOutput and end your turn.",
+    }
+  }
+  try {
+    const resp = await fetch(`${baseUrl}/api/plugin-structured-output`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+      body: JSON.stringify({ engineSessionId: sessionID, output: args }),
+      signal: AbortSignal.timeout(60_000),
+    })
+    if (!resp.ok) {
+      return {
+        accepted: false,
+        text: `Structured output could not be validated (orchestrator returned ${resp.status}). Try calling StructuredOutput again.`,
+      }
+    }
+    const result = (await resp.json()) as { ok?: unknown; text?: unknown }
+    if (typeof result.text !== "string") {
+      return { accepted: false, text: "Structured output could not be validated: malformed orchestrator response." }
+    }
+    return { accepted: result.ok === true, text: result.text }
+  } catch (e) {
+    return {
+      accepted: false,
+      text: `Structured output could not be delivered to the orchestrator: ${e instanceof Error ? e.message : String(e)}. Try calling StructuredOutput again.`,
+    }
+  }
+}
 
 export namespace SessionPrompt {
   const log = Log.create({ service: "session.prompt" })
@@ -1560,11 +1619,14 @@ NOTE: At any point in time through this workflow you should feel free to ask the
         function* (sessionID: SessionID) {
           const ctx = yield* InstanceState.context
           const slog = elog.with({ sessionID })
-          let structured: unknown | undefined
-          // Patched (agentos): number of failed StructuredOutput attempts so far
-          // (schema-validation failures rewritten to the `invalid` tool). Bounds
-          // the structured-output corrective retry loop to `format.retryCount`.
-          let structuredAttempts = 0
+          // Patched (agentos): the orchestrator ACCEPTED a structured answer for
+          // this turn, so the loop may stop. It is the only thing the fork still
+          // does with the verdict — validation, the retry budget and the failure
+          // are all the orchestrator's (see `createStructuredOutputTool`). The
+          // loop has to stop on its own, though: `toolChoice: "required"` makes
+          // the model call SOMETHING on every step, so without a break it would
+          // keep calling the tool after the answer was already delivered.
+          let structuredAccepted = false
           let step = 0
           // Patched (agentos): consecutive compactions triggered by the provider
           // REFUSING the request as too large. Reset by any step the provider
@@ -1769,14 +1831,9 @@ NOTE: At any point in time through this workflow you should feel free to ask the
               if (lastUser.format?.type === "json_schema") {
                 tools["StructuredOutput"] = createStructuredOutputTool({
                   schema: lastUser.format.schema,
-                  onSuccess(output) {
-                    structured = output
-                  },
-                  onInvalid() {
-                    // A StructuredOutput call that failed schema validation —
-                    // counts as one corrective attempt. The error text was fed
-                    // back to the model inside the tool result.
-                    structuredAttempts++
+                  submit: (args) => reportStructuredOutput(sessionID, args),
+                  onAccepted() {
+                    structuredAccepted = true
                   },
                 })
               }
@@ -1832,42 +1889,18 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                 toolChoice: format.type === "json_schema" ? "required" : undefined,
               })
 
-              if (structured !== undefined) {
-                handle.message.structured = structured
+              // Patched (agentos): the orchestrator accepted the structured
+              // answer, so this turn is done. Nothing is written onto the
+              // message here — the orchestrator stamps the validated object (and
+              // any StructuredOutputError) onto the transcript itself, so a
+              // Claude Code session and an OpenCode session end up carrying
+              // exactly the same fields. Ending the loop IS the fork's job,
+              // though: `toolChoice: "required"` would otherwise keep the model
+              // calling tools after it had already answered.
+              if (structuredAccepted) {
                 handle.message.finish = handle.message.finish ?? "stop"
                 yield* sessions.updateMessage(handle.message)
                 return "break" as const
-              }
-
-              // Patched (agentos): structured-output corrective retry cap.
-              // `createStructuredOutputTool` validates the model's output against
-              // the schema inside `execute`; on a mismatch it feeds the errors
-              // back to the model (which retries under toolChoice:"required") and
-              // bumps `structuredAttempts` via onInvalid. Once the model has burnt
-              // `format.retryCount` failed attempts without ever producing a valid
-              // object, stop looping and fail loudly with an accurate retry count
-              // (upstream had no cap and always reported `retries: 0`).
-              // NB: retryCount counts corrective retries AFTER the first attempt —
-              // retryCount=3 gives the model 4 total chances before we give up.
-              if (format.type === "json_schema" && structuredAttempts >= format.retryCount) {
-                handle.message.error = new MessageV2.StructuredOutputError({
-                  message: "Model did not produce structured output matching the schema",
-                  retries: structuredAttempts,
-                }).toObject()
-                yield* sessions.updateMessage(handle.message)
-                return "break" as const
-              }
-
-              const finished = handle.message.finish && !["tool-calls", "unknown"].includes(handle.message.finish)
-              if (finished && !handle.message.error) {
-                if (format.type === "json_schema") {
-                  handle.message.error = new MessageV2.StructuredOutputError({
-                    message: "Model did not produce structured output",
-                    retries: structuredAttempts,
-                  }).toObject()
-                  yield* sessions.updateMessage(handle.message)
-                  return "break" as const
-                }
               }
 
               if (result === "stop") return "break" as const
@@ -2218,69 +2251,49 @@ NOTE: At any point in time through this workflow you should feel free to ask the
   })
   export type CommandInput = z.infer<typeof CommandInput>
 
-  /** @internal Exported for testing */
+  /**
+   * Patched (agentos): the structured-output tool is a PASS-THROUGH.
+   *
+   * Upstream validated the model's argument here and counted the corrective
+   * retries in the run loop. Both now live in the Agent OS orchestrator, which
+   * is the single authority for structured output across both of its engines —
+   * so an `output_schema` behaves identically whether the session runs on
+   * OpenCode or on Claude Code (which reaches the same endpoint through an MCP
+   * tool). What stays here is the one thing only the fork can do: hand the model
+   * the caller's REAL JSON Schema as the tool's input schema, via the
+   * pass-through `jsonSchema()` that bypasses the zod-only tool registry.
+   *
+   * `submit` returns the text the orchestrator wants the model to read — the
+   * success line, a corrective error list, or a terminal refusal — and whether
+   * the answer was accepted.
+   *
+   * @internal Exported for testing
+   */
   export function createStructuredOutputTool(input: {
     schema: Record<string, unknown>
-    onSuccess: (output: unknown) => void
-    onInvalid?: (errors: string) => void
+    submit: (args: unknown) => Promise<StructuredSubmitResult>
+    onAccepted: () => void
   }): AITool {
     // Remove $schema property if present (not needed for tool input)
     const { $schema, ...toolSchema } = input.schema
-
-    // Patched (agentos): AI SDK does NOT enforce the JSON Schema at runtime —
-    // `jsonSchema()` without a validate callback is descriptive only, so a weak
-    // model can return values that violate enum/type/required/range constraints
-    // and they'd be silently accepted. Validate ourselves against the full
-    // schema and reject mismatches, feeding the errors back so the model
-    // corrects on the next step. The caller bounds the corrective retries via
-    // `structuredAttempts` + `format.retryCount`. The full `input.schema` (incl.
-    // `$schema`) is handed to the validator so it picks the right draft.
-    //
-    // `new Validator()` can throw synchronously for a malformed/unsupported
-    // schema (e.g. an unknown `$schema` dialect). Build it defensively: on a
-    // construction failure we degrade to treating every attempt as invalid so a
-    // broken schema yields a clean StructuredOutputError (retries exhausted)
-    // rather than crashing the agent loop.
-    let validator: Validator | undefined
-    let validatorError: string | undefined
-    try {
-      validator = new Validator(input.schema as any)
-    } catch (e) {
-      validatorError = `output_schema is not a valid JSON Schema: ${e instanceof Error ? e.message : String(e)}`
-    }
 
     return tool({
       id: "StructuredOutput" as any,
       description: STRUCTURED_OUTPUT_DESCRIPTION,
       inputSchema: jsonSchema(toolSchema as any),
       async execute(args) {
-        let valid = false
-        let errors = validatorError ?? ""
-        if (validator) {
-          try {
-            const result = validator.validate(args)
-            valid = result.valid
-            if (!valid) {
-              errors = result.errors.map((e) => `${e.instanceLocation || "(root)"}: ${e.error}`).join("; ")
-            }
-          } catch (e) {
-            errors = `schema validation failed: ${e instanceof Error ? e.message : String(e)}`
-          }
-        }
-        if (valid) {
-          input.onSuccess(args)
+        const verdict = await input.submit(args)
+        if (verdict.accepted) {
+          input.onAccepted()
           return {
-            output: "Structured output captured successfully.",
+            output: verdict.text,
             title: "Structured Output",
             metadata: { valid: true },
           }
         }
-        input.onInvalid?.(errors)
         return {
-          output:
-            `Your structured output did NOT match the required schema and was rejected:\n${errors}\n` +
-            `You MUST call the StructuredOutput tool again with a corrected object that strictly conforms to the schema.`,
-          title: "Structured Output (rejected — schema mismatch)",
+          output: verdict.text,
+          title: "Structured Output (rejected)",
           metadata: { valid: false },
         }
       },
@@ -2292,6 +2305,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
       },
     })
   }
+
   const bashRegex = /!`([^`]+)`/g
   // Match [Image N] as single token, quoted strings, or non-space sequences
   const argsRegex = /(?:\[Image\s+\d+\]|"[^"]*"|'[^']*'|[^\s"']+)/gi
