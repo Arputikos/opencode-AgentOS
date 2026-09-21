@@ -160,6 +160,179 @@ export namespace SessionPrompt {
     return { consecutive, giveUp: consecutive >= COMPACTION_REJECT_LIMIT }
   }
 
+  /**
+   * Patched (agentos): should a queued compaction be dropped instead of run?
+   *
+   * A compaction queued with `overflow: true` carries a verdict that belongs to
+   * ONE model: this provider refused THIS request as too large. The verdict is
+   * persisted on the carrier user message and can outlive the model that earned
+   * it — a credential/model swap respawns the server, the queued part is picked
+   * up again, and the compaction then runs under a model that never refused
+   * anything. That destroys conversation history to solve a problem that does
+   * not exist for the new model, and injects a synthetic message telling the
+   * user their context overflowed when it did not.
+   *
+   * Dropping is safe because the mechanism is self-healing: if the new model
+   * genuinely cannot fit the request either, the provider refuses it again and
+   * a fresh compaction is queued — with a verdict that applies to that model.
+   *
+   * An ordinary compaction (`overflow: false` — our own token accounting) is
+   * NEVER dropped: it is a statement about the conversation, not about a model.
+   */
+  export function shouldDropStaleOverflowCompaction(input: {
+    overflow: boolean
+    modelChangedSinceQueued: boolean
+  }): boolean {
+    return input.overflow && input.modelChangedSinceQueued
+  }
+
+  /**
+   * Patched (agentos): does this message CARRY an overflow compaction request
+   * that was queued under a different model?
+   *
+   * `compaction.create()` records the request as a message of its OWN: a
+   * `role: "user"` message whose single part is `compaction`, pinned to the
+   * model that was running when it was queued. That carrier is not inert — it
+   * reaches the model, because `MessageV2.toModelMessages` renders a compaction
+   * part as the user asking "What did we do so far?". So dropping the queued
+   * task alone is not enough: the turn would answer a question nobody asked
+   * instead of the request that overflowed.
+   *
+   * Only a message that is nothing BUT compaction parts qualifies — anything
+   * carrying other content is not a carrier, and content is never deleted on a
+   * guess.
+   *
+   * This is the SHAPE half of the decision and it deliberately knows nothing
+   * about whether the compaction already ran — use `findStaleOverflowCompactions`,
+   * which adds that half.
+   *
+   * Structural parameter types (rather than `MessageV2.WithParts`) so the
+   * decision is testable without building a whole message.
+   */
+  export function isOverflowCompactionCarrier(
+    message: {
+      info: { role: string; model?: { providerID: string; modelID: string } }
+      parts: { type: string; overflow?: boolean }[]
+    },
+    currentModel: { providerID: string; modelID: string },
+  ): boolean {
+    if (message.info.role !== "user") return false
+    const queued = message.info.model
+    if (!queued) return false
+    if (message.parts.length === 0) return false
+    if (!message.parts.every((part) => part.type === "compaction")) return false
+    if (!message.parts.some((part) => part.overflow === true)) return false
+    return shouldDropStaleOverflowCompaction({
+      overflow: true,
+      modelChangedSinceQueued: queued.providerID !== currentModel.providerID || queued.modelID !== currentModel.modelID,
+    })
+  }
+
+  export interface OverflowScanMessage {
+    info: {
+      id: string
+      role: string
+      parentID?: string
+      /** `unknown`, not `boolean`: a USER message carries a summary OBJECT under the same name. */
+      summary?: unknown
+      finish?: string
+      error?: unknown
+      model?: { providerID: string; modelID: string }
+    }
+    parts: { type: string; overflow?: boolean }[]
+  }
+
+  /**
+   * Patched (agentos): the carriers this turn must pretend were never queued.
+   *
+   * A carrier whose compaction ALREADY RAN is untouchable, and that is not a
+   * detail. `MessageV2.filterCompacted` cuts the history AT such a carrier and
+   * returns it as `msgs[0]`, with the `summary` assistant message right behind
+   * it — so removing it would hand the provider a window that opens on an
+   * assistant message. Anthropic rejects that outright ("first message must use
+   * the 'user' role") and `ProviderTransform` does not reorder or prepend
+   * anything, so every later turn of that session would fail until a new
+   * compaction moved the window. It also strips the summary of the question it
+   * answers.
+   *
+   * "Already ran" is decided with `filterCompacted`'s own predicate — an
+   * assistant `summary` message that finished without an error and points at the
+   * carrier — so the two can never disagree about which carrier is spent.
+   */
+  export function findStaleOverflowCompactions(
+    msgs: OverflowScanMessage[],
+    currentModel: { providerID: string; modelID: string },
+  ): { id: string; queuedModel: { providerID: string; modelID: string } }[] {
+    const summarised = new Set<string>()
+    for (const { info } of msgs) {
+      if (info.role === "assistant" && info.summary === true && info.finish && !info.error && info.parentID)
+        summarised.add(info.parentID)
+    }
+    const stale: { id: string; queuedModel: { providerID: string; modelID: string } }[] = []
+    for (const msg of msgs) {
+      const queuedModel = msg.info.model
+      if (!queuedModel) continue
+      if (summarised.has(msg.info.id)) continue
+      if (!isOverflowCompactionCarrier(msg, currentModel)) continue
+      stale.push({ id: msg.info.id, queuedModel })
+    }
+    return stale
+  }
+
+  export interface TurnScan {
+    lastUser: MessageV2.User | undefined
+    lastAssistant: MessageV2.Assistant | undefined
+    lastFinished: MessageV2.Assistant | undefined
+    /**
+     * Positions in `msgs` (which is already in chronological order). Message IDs
+     * encode time in a 48-bit field that WRAPS (~every 795 days), so comparing
+     * two IDs as strings answers "which is newer?" incorrectly for any pair that
+     * straddles a wrap — see `id.ts`. Positions in the time-ordered list are the
+     * real ordering and are immune to that.
+     */
+    lastUserIdx: number
+    lastAssistantIdx: number
+    lastFinishedIdx: number
+    tasks: (MessageV2.CompactionPart | MessageV2.SubtaskPart)[]
+  }
+
+  /**
+   * Patched (agentos): read the turn's shape off the message list.
+   *
+   * Lifted out of `runLoop` because it has to run TWICE in one iteration — once
+   * over the stored history, and again after a stale overflow compaction carrier
+   * is taken out of it. Every index moves when a message disappears from the
+   * middle of the list, and `lastUser` itself may be the message that went.
+   */
+  export function scanTurn(msgs: MessageV2.WithParts[]): TurnScan {
+    let lastUser: MessageV2.User | undefined
+    let lastAssistant: MessageV2.Assistant | undefined
+    let lastFinished: MessageV2.Assistant | undefined
+    let lastUserIdx = -1
+    let lastAssistantIdx = -1
+    let lastFinishedIdx = -1
+    const tasks: (MessageV2.CompactionPart | MessageV2.SubtaskPart)[] = []
+    for (let i = msgs.length - 1; i >= 0; i--) {
+      const msg = msgs[i]
+      if (!lastUser && msg.info.role === "user") {
+        lastUser = msg.info
+        lastUserIdx = i
+      }
+      if (!lastAssistant && msg.info.role === "assistant") {
+        lastAssistant = msg.info
+        lastAssistantIdx = i
+      }
+      if (!lastFinished && msg.info.role === "assistant" && msg.info.finish) {
+        lastFinished = msg.info
+        lastFinishedIdx = i
+      }
+      if (lastUser && lastFinished) break
+      const task = msg.parts.filter((part) => part.type === "compaction" || part.type === "subtask")
+      if (task && !lastFinished) tasks.push(...task)
+    }
+    return { lastUser, lastAssistant, lastFinished, lastUserIdx, lastAssistantIdx, lastFinishedIdx, tasks }
+  }
+
   export interface Interface {
     readonly cancel: (sessionID: SessionID) => Effect.Effect<void>
     readonly prompt: (input: PromptInput) => Effect.Effect<MessageV2.WithParts>
@@ -1648,36 +1821,10 @@ NOTE: At any point in time through this workflow you should feel free to ask the
 
             let msgs = yield* MessageV2.filterCompactedEffect(sessionID)
 
-            let lastUser: MessageV2.User | undefined
-            let lastAssistant: MessageV2.Assistant | undefined
-            let lastFinished: MessageV2.Assistant | undefined
-            // Positions in `msgs` (which is already in chronological order). Message IDs
-            // encode time in a 48-bit field that WRAPS (~every 795 days), so comparing
-            // two IDs as strings answers "which is newer?" incorrectly for any pair that
-            // straddles a wrap — see `id.ts`. Positions in the time-ordered list are the
-            // real ordering and are immune to that.
-            let lastUserIdx = -1
-            let lastAssistantIdx = -1
-            let lastFinishedIdx = -1
-            let tasks: (MessageV2.CompactionPart | MessageV2.SubtaskPart)[] = []
-            for (let i = msgs.length - 1; i >= 0; i--) {
-              const msg = msgs[i]
-              if (!lastUser && msg.info.role === "user") {
-                lastUser = msg.info
-                lastUserIdx = i
-              }
-              if (!lastAssistant && msg.info.role === "assistant") {
-                lastAssistant = msg.info
-                lastAssistantIdx = i
-              }
-              if (!lastFinished && msg.info.role === "assistant" && msg.info.finish) {
-                lastFinished = msg.info
-                lastFinishedIdx = i
-              }
-              if (lastUser && lastFinished) break
-              const task = msg.parts.filter((part) => part.type === "compaction" || part.type === "subtask")
-              if (task && !lastFinished) tasks.push(...task)
-            }
+            // Patched (agentos): the scan lives in `scanTurn` because the stale
+            // overflow gate below may have to re-run it on a shorter list.
+            let { lastUser, lastAssistant, lastFinished, lastUserIdx, lastAssistantIdx, lastFinishedIdx, tasks } =
+              scanTurn(msgs)
 
             if (!lastUser) throw new Error("No user message found in stream. This should never happen.")
 
@@ -1692,28 +1839,73 @@ NOTE: At any point in time through this workflow you should feel free to ask the
             // only — `msgs` is reloaded from storage on each prompt/resume, so it never
             // persists a fake user choice; it just re-resolves every time. No-op when the
             // model is unchanged or the agent has no configured model.
-            {
-              const liveAgent = yield* agents.get(lastUser.agent)
-              // The model this turn SHOULD run on: the agent's own model if it has
-              // one, else the global default — `config.model`, i.e. opencode.json's
-              // top-level `model`, which AgentOS rewrites to the current model on
-              // every spawn. Deliberately NOT `lastModel`: that returns the STALE
-              // pinned model of the last user message, which is exactly what we are
-              // overriding. (AgentOS configs set the model globally, not per-agent —
-              // `agent: {}` is empty — so `liveAgent.model` is undefined and the
-              // defaultModel branch is the one that actually fires.)
-              const target = liveAgent?.model ?? (yield* provider.defaultModel())
-              if (
-                target &&
-                (target.providerID !== lastUser.model.providerID ||
-                  target.modelID !== lastUser.model.modelID)
-              ) {
-                yield* slog.info("rebinding pinned user-message model to the current model", {
-                  from: `${lastUser.model.providerID}/${lastUser.model.modelID}`,
-                  to: `${target.providerID}/${target.modelID}`,
-                })
-                lastUser.model = { providerID: target.providerID, modelID: target.modelID }
+            const liveAgent = yield* agents.get(lastUser.agent)
+            // The model this turn SHOULD run on: the agent's own model if it has
+            // one, else the global default — `config.model`, i.e. opencode.json's
+            // top-level `model`, which AgentOS rewrites to the current model on
+            // every spawn. Deliberately NOT `lastModel`: that returns the STALE
+            // pinned model of the last user message, which is exactly what we are
+            // overriding. (AgentOS configs set the model globally, not per-agent —
+            // `agent: {}` is empty — so `liveAgent.model` is undefined and the
+            // defaultModel branch is the one that actually fires.)
+            const target = liveAgent?.model ?? (yield* provider.defaultModel())
+
+            // Patched (agentos): drop a compaction that was queued under a model
+            // which is no longer the one running — carrier message and all.
+            //
+            // This runs BEFORE the rebind, while every message still carries the
+            // model it was persisted with, and it takes the whole carrier out of
+            // `msgs` rather than just its task: the carrier IS a prompt
+            // (`toModelMessages` renders a compaction part as the user asking
+            // "What did we do so far?"), so dequeuing alone would answer a question
+            // nobody asked instead of the request that overflowed — and with no
+            // compaction to produce a summary message, `filterCompacted` would never
+            // cut that stray turn out of any later request either. A carrier whose
+            // compaction already RAN is left alone — see `findStaleOverflowCompactions`.
+            if (target) {
+              const currentModel = { providerID: target.providerID, modelID: target.modelID }
+              const stale = findStaleOverflowCompactions(msgs, currentModel)
+              if (stale.length > 0) {
+                const staleIds = new Set(stale.map((entry) => entry.id))
+                const kept = msgs.filter((msg) => !staleIds.has(msg.info.id))
+                // A turn with nothing left to answer cannot run. Keeping the stale
+                // request is the lesser evil, and it is a shape worth a loud log.
+                if (kept.some((msg) => msg.info.role === "user")) {
+                  for (const entry of stale) {
+                    yield* slog.info("dropping a stale overflow compaction", {
+                      messageID: entry.id,
+                      queuedUnder: `${entry.queuedModel.providerID}/${entry.queuedModel.modelID}`,
+                      runningUnder: `${currentModel.providerID}/${currentModel.modelID}`,
+                      reason: "the provider's 'request too large' verdict belongs to the model that produced it",
+                    })
+                  }
+                  msgs = kept
+                  const rescan = scanTurn(msgs)
+                  lastUser = rescan.lastUser
+                  lastAssistant = rescan.lastAssistant
+                  lastFinished = rescan.lastFinished
+                  lastUserIdx = rescan.lastUserIdx
+                  lastAssistantIdx = rescan.lastAssistantIdx
+                  lastFinishedIdx = rescan.lastFinishedIdx
+                  tasks = rescan.tasks
+                  if (!lastUser) throw new Error("No user message found in stream. This should never happen.")
+                } else {
+                  yield* slog.warn("keeping a stale overflow compaction — it is the only user message left", {
+                    runningUnder: `${currentModel.providerID}/${currentModel.modelID}`,
+                  })
+                }
               }
+            }
+
+            if (
+              target &&
+              (target.providerID !== lastUser.model.providerID || target.modelID !== lastUser.model.modelID)
+            ) {
+              yield* slog.info("rebinding pinned user-message model to the current model", {
+                from: `${lastUser.model.providerID}/${lastUser.model.modelID}`,
+                to: `${target.providerID}/${target.modelID}`,
+              })
+              lastUser.model = { providerID: target.providerID, modelID: target.modelID }
             }
 
             const lastAssistantMsg = msgs.findLast(

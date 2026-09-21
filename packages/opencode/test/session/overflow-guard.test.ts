@@ -56,6 +56,176 @@ describe("session overflow guard", () => {
     })
   })
 
+  describe("SessionPrompt.shouldDropStaleOverflowCompaction", () => {
+    test("drops an overflow compaction queued under a different model", () => {
+      // The production case: the verdict was earned by gpt-5.4-mini (400k window),
+      // the queued compaction was picked up after a swap to gpt-5.6-luna (1.05M)
+      // on a ~501-token conversation.
+      expect(SessionPrompt.shouldDropStaleOverflowCompaction({ overflow: true, modelChangedSinceQueued: true })).toBe(
+        true,
+      )
+    })
+
+    test("runs an overflow compaction when the model is still the one that was refused", () => {
+      expect(SessionPrompt.shouldDropStaleOverflowCompaction({ overflow: true, modelChangedSinceQueued: false })).toBe(
+        false,
+      )
+    })
+
+    test("never drops an ordinary compaction, model change or not", () => {
+      // `overflow: false` is our own token accounting — a statement about the
+      // conversation, which no model swap can invalidate.
+      for (const modelChangedSinceQueued of [true, false]) {
+        expect(SessionPrompt.shouldDropStaleOverflowCompaction({ overflow: false, modelChangedSinceQueued })).toBe(
+          false,
+        )
+      }
+    })
+  })
+
+  describe("SessionPrompt.isOverflowCompactionCarrier", () => {
+    const MODEL_A = { providerID: "openai", modelID: "gpt-5.4-mini" }
+    const MODEL_B = { providerID: "openai", modelID: "gpt-5.6-luna" }
+    const carrier = (
+      model: { providerID: string; modelID: string },
+      part: { type: string; overflow?: boolean } = { type: "compaction", overflow: true },
+    ) => ({
+      info: { role: "user", model },
+      parts: [part],
+    })
+
+    test("a carrier queued under another model is stale", () => {
+      expect(SessionPrompt.isOverflowCompactionCarrier(carrier(MODEL_A), MODEL_B)).toBe(true)
+    })
+
+    test("the same model is not stale — the verdict still applies", () => {
+      expect(SessionPrompt.isOverflowCompactionCarrier(carrier(MODEL_A), MODEL_A)).toBe(false)
+    })
+
+    test("an ordinary compaction carrier is never stale", () => {
+      expect(
+        SessionPrompt.isOverflowCompactionCarrier(carrier(MODEL_A, { type: "compaction", overflow: false }), MODEL_B),
+      ).toBe(false)
+      // `overflow` absent entirely — an older part, or our own token accounting.
+      expect(SessionPrompt.isOverflowCompactionCarrier(carrier(MODEL_A, { type: "compaction" }), MODEL_B)).toBe(false)
+    })
+
+    test("never touches a message that carries content of its own", () => {
+      // The carrier is a message whose ONLY part is the compaction request. A
+      // message with text in it is the user talking, and dropping it would
+      // delete what they said.
+      expect(
+        SessionPrompt.isOverflowCompactionCarrier(
+          {
+            info: { role: "user", model: MODEL_A },
+            parts: [{ type: "text" }, { type: "compaction", overflow: true }],
+          },
+          MODEL_B,
+        ),
+      ).toBe(false)
+      expect(
+        SessionPrompt.isOverflowCompactionCarrier({ info: { role: "user", model: MODEL_A }, parts: [] }, MODEL_B),
+      ).toBe(false)
+      expect(
+        SessionPrompt.isOverflowCompactionCarrier(
+          { info: { role: "assistant" }, parts: [{ type: "compaction", overflow: true }] },
+          MODEL_B,
+        ),
+      ).toBe(false)
+    })
+  })
+
+  describe("SessionPrompt.findStaleOverflowCompactions", () => {
+    const MODEL_A = { providerID: "openai", modelID: "gpt-5.4-mini" }
+    const MODEL_B = { providerID: "openai", modelID: "gpt-5.6-luna" }
+    const carrier = (id: string) => ({
+      info: { id, role: "user", model: MODEL_A },
+      parts: [{ type: "compaction", overflow: true }],
+    })
+    const summaryFor = (id: string, over: Partial<{ summary: boolean; finish: string; error: unknown }> = {}) => ({
+      info: { id: `${id}-summary`, role: "assistant", parentID: id, summary: true, finish: "stop", ...over },
+      parts: [{ type: "text" }],
+    })
+    const user = (id: string) => ({
+      info: { id, role: "user", model: MODEL_A },
+      parts: [{ type: "text" }],
+    })
+
+    test("finds a queued carrier once the model changed", () => {
+      const stale = SessionPrompt.findStaleOverflowCompactions([user("u1"), carrier("c1")], MODEL_B)
+      expect(stale).toEqual([{ id: "c1", queuedModel: MODEL_A }])
+    })
+
+    test("leaves a carrier whose compaction ALREADY RAN, model change or not", () => {
+      // `filterCompacted` cuts the history AT that carrier and returns it as
+      // msgs[0], with the summary right behind it. Remove it and the window
+      // opens on an assistant message — Anthropic rejects the request outright
+      // ("first message must use the 'user' role") for every later turn.
+      const msgs = [carrier("c1"), summaryFor("c1"), user("u2")]
+      expect(SessionPrompt.findStaleOverflowCompactions(msgs, MODEL_B)).toEqual([])
+    })
+
+    test("an unfinished or errored summary does not count as processed", () => {
+      // Same predicate `filterCompacted` uses — the two must never disagree
+      // about which carrier is spent.
+      for (const over of [
+        { finish: undefined as unknown as string },
+        { error: { name: "APIError" } },
+        { summary: false },
+      ]) {
+        const stale = SessionPrompt.findStaleOverflowCompactions(
+          [carrier("c1"), summaryFor("c1", over), user("u2")],
+          MODEL_B,
+        )
+        expect(stale.map((entry) => entry.id)).toEqual(["c1"])
+      }
+    })
+
+    test("a summary belonging to another carrier does not protect this one", () => {
+      const msgs = [carrier("c0"), summaryFor("c0"), user("u1"), carrier("c1")]
+      expect(SessionPrompt.findStaleOverflowCompactions(msgs, MODEL_B).map((entry) => entry.id)).toEqual(["c1"])
+    })
+
+    test("nothing is stale while the model is unchanged", () => {
+      expect(SessionPrompt.findStaleOverflowCompactions([user("u1"), carrier("c1")], MODEL_A)).toEqual([])
+    })
+  })
+
+  describe("SessionPrompt.scanTurn", () => {
+    const user = (id: string, parts: { type: string; overflow?: boolean }[] = [{ type: "text" }]) =>
+      ({ info: { id, role: "user", model: { providerID: "openai", modelID: "gpt-5.6-luna" } }, parts }) as never
+    const assistant = (id: string, finish?: string) =>
+      ({ info: { id, role: "assistant", ...(finish ? { finish } : {}) }, parts: [] }) as never
+
+    test("reports the last user/assistant positions, not their ID order", () => {
+      const scan = SessionPrompt.scanTurn([user("u1"), assistant("a1", "stop"), user("u2")])
+      expect(String(scan.lastUser?.id)).toBe("u2")
+      expect(scan.lastUserIdx).toBe(2)
+      expect(scan.lastAssistantIdx).toBe(1)
+      expect(scan.lastFinishedIdx).toBe(1)
+    })
+
+    test("collects only the tasks newer than the last finished assistant message", () => {
+      const scan = SessionPrompt.scanTurn([
+        user("u1", [{ type: "compaction", overflow: true }]),
+        assistant("a1", "stop"),
+        user("u2", [{ type: "compaction", overflow: true }]),
+      ])
+      expect(scan.tasks).toHaveLength(1)
+    })
+
+    test("re-scanning a list with the carrier removed moves lastUser back to the real message", () => {
+      // This is what the loop does after dropping a stale carrier: the request
+      // that overflowed becomes the message being answered again.
+      const msgs = [user("u1"), assistant("a1"), user("carrier", [{ type: "compaction", overflow: true }])]
+      expect(String(SessionPrompt.scanTurn(msgs).lastUser?.id)).toBe("carrier")
+      const withoutCarrier = msgs.filter((m) => (m as unknown as { info: { id: string } }).info.id !== "carrier")
+      const rescan = SessionPrompt.scanTurn(withoutCarrier)
+      expect(String(rescan.lastUser?.id)).toBe("u1")
+      expect(rescan.tasks).toHaveLength(0)
+    })
+  })
+
   describe("SessionCompaction.continuePrompt", () => {
     test("says nothing about overflow on a routine compaction", () => {
       const text = SessionCompaction.continuePrompt({ overflow: false, hadMedia: false })
