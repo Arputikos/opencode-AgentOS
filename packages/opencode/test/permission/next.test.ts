@@ -710,8 +710,43 @@ it.live("reply - reject with message throws CorrectedError", () =>
       if (Exit.isFailure(exit)) {
         const err = Cause.squash(exit.cause)
         expect(err).toBeInstanceOf(Permission.CorrectedError)
-        expect(String(err)).toContain("Use a safer command")
+        expect((err as Permission.CorrectedError).message).toBe("Use a safer command")
       }
+    }),
+  ),
+)
+
+it.live("reply - reject with message rejects only its own request (no cascade)", () =>
+  withDir({ git: true }, () =>
+    Effect.gen(function* () {
+      const a = yield* ask({
+        id: PermissionID.make("per_test2c"),
+        sessionID: SessionID.make("session_same"),
+        permission: "bash",
+        patterns: ["rm -rf /"],
+        metadata: {},
+        always: [],
+        ruleset: [],
+      }).pipe(Effect.forkScoped)
+      const b = yield* ask({
+        id: PermissionID.make("per_test2d"),
+        sessionID: SessionID.make("session_same"),
+        permission: "bash",
+        patterns: ["git push"],
+        metadata: {},
+        always: [],
+        ruleset: [],
+      }).pipe(Effect.forkScoped)
+
+      yield* waitForPending(2)
+      yield* reply({ requestID: PermissionID.make("per_test2c"), reply: "reject", message: "Blocked" })
+
+      const exitA = yield* Fiber.await(a)
+      expect(Exit.isFailure(exitA)).toBe(true)
+      // The other call is still waiting for its own decision.
+      expect(yield* waitForPending(1)).toHaveLength(1)
+      yield* reply({ requestID: PermissionID.make("per_test2d"), reply: "once" })
+      yield* Fiber.join(b)
     }),
   ),
 )
