@@ -174,6 +174,8 @@ function fake(
     },
     updateToolCall: Effect.fn("TestSessionProcessor.updateToolCall")(() => Effect.succeed(undefined)),
     completeToolCall: Effect.fn("TestSessionProcessor.completeToolCall")(() => Effect.void),
+    startToolCall: Effect.fn("TestSessionProcessor.startToolCall")(() => Effect.void),
+    toolStartedAt: () => undefined,
     process: Effect.fn("TestSessionProcessor.process")(() => Effect.succeed(result)),
     overflowRejected: false,
   } satisfies SessionProcessorModule.SessionProcessor.Handle

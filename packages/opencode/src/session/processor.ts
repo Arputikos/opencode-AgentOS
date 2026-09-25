@@ -57,6 +57,15 @@ export namespace SessionProcessor {
         attachments?: MessageV2.FilePart[]
       },
     ) => Effect.Effect<void>
+    /**
+     * Agent OS: the tool's `execute` has begun — THIS is the call's `time.start`.
+     * The stream's `tool-call` event can reach the processor only after the tool
+     * already ran, so stamping start there (or on each `ctx.metadata` update, which
+     * bash uses to stream its output) measured a 1 s call as a few milliseconds.
+     */
+    readonly startToolCall: (toolCallID: string) => Effect.Effect<void>
+    /** When `startToolCall` saw the call begin, if it has. */
+    readonly toolStartedAt: (toolCallID: string) => number | undefined
     readonly process: (streamInput: LLM.StreamInput) => Effect.Effect<Result>
   }
 
@@ -79,6 +88,8 @@ export namespace SessionProcessor {
 
   interface ProcessorContext extends Input {
     toolcalls: Record<string, ToolCall>
+    /** Agent OS: when each tool call's `execute` began (epoch ms) — see `startToolCall`. */
+    toolStarts: Record<string, number>
     shouldBreak: boolean
     snapshot: string | undefined
     blocked: boolean
@@ -130,6 +141,7 @@ export namespace SessionProcessor {
           sessionID: input.sessionID,
           model: input.model,
           toolcalls: {},
+          toolStarts: {},
           shouldBreak: false,
           snapshot: initialSnapshot,
           blocked: false,
@@ -150,6 +162,7 @@ export namespace SessionProcessor {
         const settleToolCall = Effect.fn("SessionProcessor.settleToolCall")(function* (toolCallID: string) {
           const done = ctx.toolcalls[toolCallID]?.done
           delete ctx.toolcalls[toolCallID]
+          delete ctx.toolStarts[toolCallID]
           if (done) yield* Deferred.succeed(done, undefined).pipe(Effect.ignore)
         })
 
@@ -182,6 +195,17 @@ export namespace SessionProcessor {
             sessionID: part.sessionID,
           }
           return part
+        })
+
+        const startToolCall = Effect.fn("SessionProcessor.startToolCall")(function* (toolCallID: string) {
+          if (ctx.toolStarts[toolCallID] !== undefined) return
+          const start = Date.now()
+          ctx.toolStarts[toolCallID] = start
+          // Already `running` (the `tool-call` event got here first): correct its start.
+          // Still pending: the `tool-call` handler takes the start from `toolStarts`.
+          yield* updateToolCall(toolCallID, (part) =>
+            part.state.status === "running" ? { ...part, state: { ...part.state, time: { start } } } : part,
+          )
         })
 
         const completeToolCall = Effect.fn("SessionProcessor.completeToolCall")(function* (
@@ -310,7 +334,7 @@ export namespace SessionProcessor {
                   ...match.state,
                   status: "running",
                   input: value.input,
-                  time: { start: Date.now() },
+                  time: { start: ctx.toolStarts[value.toolCallId] ?? Date.now() },
                 },
                 metadata: match.metadata?.providerExecuted
                   ? { ...value.providerMetadata, providerExecuted: true }
@@ -631,6 +655,8 @@ export namespace SessionProcessor {
           },
           updateToolCall,
           completeToolCall,
+          startToolCall,
+          toolStartedAt: (toolCallID: string) => ctx.toolStarts[toolCallID],
           process,
         } satisfies Handle
       })

@@ -1371,6 +1371,50 @@ unix(
   30_000,
 )
 
+// Agent OS: a tool call's `time.start` is when the tool began EXECUTING. It used
+// to be stamped when the processor got round to the stream's `tool-call` event
+// and again on every `ctx.metadata` update — bash streams its output through
+// metadata — so a 1 s call finished "0 ms" after it started.
+unix(
+  "a tool call's time spans its whole execution",
+  () =>
+    provideTmpdirServer(
+      ({ dir, llm }) =>
+        Effect.gen(function* () {
+          const prompt = yield* SessionPrompt.Service
+          const sessions = yield* Session.Service
+          const chat = yield* sessions.create({
+            title: "Tool timing",
+            permission: [{ permission: "*", pattern: "*", action: "allow" }],
+          })
+          yield* prompt.prompt({
+            sessionID: chat.id,
+            agent: "build",
+            noReply: true,
+            parts: [{ type: "text", text: "run bash" }],
+          })
+          yield* llm.tool("bash", {
+            command: "echo before; sleep 1; echo after",
+            description: "Sleep a second",
+            workdir: path.resolve(dir),
+          })
+          yield* llm.text("done")
+
+          yield* prompt.loop({ sessionID: chat.id })
+          const msgs = yield* MessageV2.filterCompactedEffect(chat.id)
+          const tool = msgs
+            .flatMap((msg) => msg.parts)
+            .find((part): part is MessageV2.ToolPart => part.type === "tool" && part.tool === "bash")
+          expect(tool?.state.status).toBe("completed")
+          if (tool?.state.status !== "completed") return
+          expect(tool.state.output).toContain("after")
+          expect(tool.state.time.end - tool.state.time.start).toBeGreaterThanOrEqual(900)
+        }),
+      { git: true, config: providerCfg },
+    ),
+  30_000,
+)
+
 unix(
   "cancel interrupts loop queued behind shell",
   () =>
