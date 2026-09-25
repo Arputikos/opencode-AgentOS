@@ -129,8 +129,20 @@ export namespace MCP {
 
   const sanitize = (s: string) => s.replace(/[^a-zA-Z0-9_-]/g, "_")
 
+  // Patched (agentos): the server each converted tool came from. The tool key
+  // (`<server>_<tool>`, both sanitized) cannot be split back — server names
+  // contain `_` and `-` as freely as tool names do — so the origin is recorded
+  // when the tool is built. A WeakMap because `tools()` rebuilds every tool on
+  // every call; the entries go away with the tools.
+  const toolServers = new WeakMap<Tool, string>()
+
+  /** Patched (agentos): the MCP server a tool from `tools()` belongs to; undefined for any other tool. */
+  export function serverOf(tool: Tool): string | undefined {
+    return toolServers.get(tool)
+  }
+
   // Convert MCP tool definition to AI SDK Tool type
-  function convertMcpTool(mcpTool: MCPToolDef, client: MCPClient, timeout?: number): Tool {
+  function convertMcpTool(mcpTool: MCPToolDef, client: MCPClient, clientName: string, timeout?: number): Tool {
     const inputSchema = mcpTool.inputSchema
 
     // Spread first, then override type to ensure it's always "object"
@@ -141,7 +153,7 @@ export namespace MCP {
       additionalProperties: false,
     }
 
-    return dynamicTool({
+    const converted = dynamicTool({
       description: mcpTool.description ?? "",
       inputSchema: jsonSchema(schema),
       execute: async (args: unknown) => {
@@ -158,6 +170,8 @@ export namespace MCP {
         )
       },
     })
+    toolServers.set(converted, clientName)
+    return converted
   }
 
   function defs(key: string, client: MCPClient, timeout?: number) {
@@ -656,7 +670,12 @@ export namespace MCP {
 
               const timeout = entry?.timeout ?? defaultTimeout
               for (const mcpTool of listed) {
-                result[sanitize(clientName) + "_" + sanitize(mcpTool.name)] = convertMcpTool(mcpTool, client, timeout)
+                result[sanitize(clientName) + "_" + sanitize(mcpTool.name)] = convertMcpTool(
+                  mcpTool,
+                  client,
+                  clientName,
+                  timeout,
+                )
               }
             }),
           { concurrency: "unbounded" },

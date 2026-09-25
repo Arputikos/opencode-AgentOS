@@ -16,7 +16,7 @@ import { NotFoundError } from "@/storage/db"
 import { ModelID, ProviderID } from "@/provider/schema"
 import { Effect, Layer, Context } from "effect"
 import { InstanceState } from "@/effect/instance-state"
-import { isOverflow as overflow } from "./overflow"
+import { compactionThreshold, isOverflow as overflow } from "./overflow"
 
 export namespace SessionCompaction {
   const log = Log.create({ service: "session.compaction" })
@@ -75,6 +75,11 @@ export namespace SessionCompaction {
       tokens: MessageV2.Assistant["tokens"]
       model: Provider.Model
     }) => Effect.Effect<boolean>
+    /**
+     * Patched (agentos): the input size at which auto-compaction kicks in, or
+     * undefined when auto-compaction is off or the model's window is unknown.
+     */
+    readonly threshold: (model: Provider.Model) => Effect.Effect<number | undefined>
     readonly prune: (input: { sessionID: SessionID }) => Effect.Effect<void>
     readonly process: (input: {
       parentID: MessageID
@@ -120,6 +125,12 @@ export namespace SessionCompaction {
         model: Provider.Model
       }) {
         return overflow({ cfg: yield* config.get(), tokens: input.tokens, model: input.model })
+      })
+
+      const threshold = Effect.fn("SessionCompaction.threshold")(function* (model: Provider.Model) {
+        const cfg = yield* config.get()
+        if (cfg.compaction?.auto === false) return undefined
+        return compactionThreshold({ cfg, model })
       })
 
       // goes backwards through parts until there are PRUNE_PROTECT tokens worth of tool
@@ -311,6 +322,10 @@ When constructing the summary, try to stick to this template:
           }).toObject()
           processor.message.finish = "error"
           yield* session.updateMessage(processor.message)
+          // Patched (agentos): publish it too — an error that only sits on the
+          // message never reaches the Agent OS orchestrator, and the turn
+          // would be reported as completed.
+          yield* bus.publish(Session.Event.Error, { sessionID: input.sessionID, error: processor.message.error })
           return "stop"
         }
 
@@ -425,6 +440,7 @@ When constructing the summary, try to stick to this template:
 
       return Service.of({
         isOverflow,
+        threshold,
         prune,
         process: processCompaction,
         create,

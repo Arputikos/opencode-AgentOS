@@ -38,6 +38,7 @@ import { Tool } from "@/tool/tool"
 import { Permission } from "@/permission"
 import { SessionStatus } from "./status"
 import { LLM } from "./llm"
+import { RequestFootprint } from "./request-footprint"
 import { Shell } from "@/shell/shell"
 import { AppFileSystem } from "@/filesystem"
 import { Truncate } from "@/tool/truncate"
@@ -127,38 +128,73 @@ export namespace SessionPrompt {
   const elog = EffectLogger.create({ service: "session.prompt" })
 
   /**
-   * Patched (agentos): how many provider "request too large" rejections in a row
-   * may be answered with a compaction before the turn gives up.
+   * Patched (agentos): how many compactions in a row the loop may start before
+   * the turn gives up. "In a row" means no request in between went through
+   * without asking for another compaction.
    *
-   * 1 would be wrong — a single rejection followed by one compaction is normal
-   * recovery and usually works. 2 is the smallest value that distinguishes
-   * "compaction fixed it" from "compaction is irrelevant to what overflowed":
-   * if the request is refused again immediately after a compaction, the excess
-   * is not in the conversation history and no further compaction will change
-   * that.
+   * 1 would be wrong — a single compaction followed by a request that fits is
+   * normal recovery. 2 is the smallest value that distinguishes "compaction
+   * fixed it" from "compaction is irrelevant to what overflowed": if the very
+   * request built from the compacted conversation needs compacting again —
+   * because the provider refused it, or because our own accounting still puts
+   * it over the threshold — the excess is not in the conversation history
+   * (tool schemas, the system prompt, a window smaller than advertised) and no
+   * further compaction will change that.
    */
-  const COMPACTION_REJECT_LIMIT = 2
+  const COMPACTION_STREAK_LIMIT = 2
 
   /**
-   * Patched (agentos): advance the overflow-compaction circuit breaker.
+   * Patched (agentos): may the loop start another compaction?
    *
-   * `rejected` is true when the provider refused the request as too large
-   * (`ContextOverflowError`), false when our own token accounting decided a
-   * compaction was due. Only the former can loop: a rejection is answered with
-   * a compaction, and if the excess was never in the conversation the next
-   * request is rejected identically, forever.
+   * Every compaction the loop asks for goes through here — the provider (or
+   * the pre-flight check) refusing a request as too large AND our own token
+   * accounting deciding one is due. Counting only refusals left the second
+   * kind unguarded, and it loops just as well: a request whose tool schemas
+   * alone exceed the threshold is compacted, the compacted request is over the
+   * threshold again, and so on (observed in production with a 120-tool MCP
+   * server: a compaction every few seconds until the operator stopped the
+   * session). A long autonomous turn that compacts every so often is
+   * unaffected: the requests in between fit, and each resets the streak.
    *
-   * Returns the new consecutive count and whether to give up instead of
-   * compacting again.
+   * `fixed` is what every request carries whatever the conversation holds —
+   * system prompt and tool schemas (`RequestFootprint.fixed`); `threshold` is
+   * where auto-compaction kicks in, undefined when it is off. When the fixed
+   * part alone reaches the threshold, even the first compaction is pointless.
    */
-  export function nextOverflowCompaction(input: { rejected: boolean; consecutive: number }): {
+  export function nextOverflowCompaction(input: {
     consecutive: number
-    giveUp: boolean
-  } {
-    if (!input.rejected) return { consecutive: 0, giveUp: false }
+    fixed: number
+    threshold: number | undefined
+  }): { action: "compact" | "no-room" | "give-up"; consecutive: number } {
+    if (input.threshold !== undefined && input.fixed >= input.threshold) {
+      return { action: "no-room", consecutive: input.consecutive }
+    }
     const consecutive = input.consecutive + 1
-    return { consecutive, giveUp: consecutive >= COMPACTION_REJECT_LIMIT }
+    return { action: consecutive >= COMPACTION_STREAK_LIMIT ? "give-up" : "compact", consecutive }
   }
+
+  /**
+   * Patched (agentos): did this step end empty in the way an oversized request
+   * does — no text, no reasoning, no tool call, no file, and a finish that
+   * explains nothing (`length`, `other`, `unknown`, or none)? A provider can end
+   * a request that way without an error (OpenAI's `incomplete:
+   * max_output_tokens` with zero usage, seen when a huge tool set came along),
+   * and the turn would otherwise end "successfully" with an empty reply.
+   *
+   * Any other empty finish (`content-filter`, an empty `stop`) has its own
+   * explanation, unrelated to the request's size: it is left to the Agent OS
+   * orchestrator, which reports empty turns neutrally and without a credential
+   * swap.
+   */
+  export function isEmptyStep(input: { parts: MessageV2.Part[]; finish: string | undefined }) {
+    if (input.finish !== undefined && !UNEXPLAINED_FINISHES.has(input.finish)) return false
+    return !input.parts.some((part) => {
+      if (part.type === "text" || part.type === "reasoning") return part.text.length > 0
+      return part.type === "tool" || part.type === "file"
+    })
+  }
+
+  const UNEXPLAINED_FINISHES = new Set(["length", "other", "unknown"])
 
   /**
    * Patched (agentos): should a queued compaction be dropped instead of run?
@@ -1812,10 +1848,76 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           // keep calling the tool after the answer was already delivered.
           let structuredAccepted = false
           let step = 0
-          // Patched (agentos): consecutive compactions triggered by the provider
-          // REFUSING the request as too large. Reset by any step the provider
-          // actually accepted. See COMPACTION_REJECT_LIMIT below.
-          let overflowCompactions = 0
+          // Patched (agentos): compactions started in a row, with no request in
+          // between that fit. See COMPACTION_STREAK_LIMIT.
+          let compactionStreak = 0
+
+          // Patched (agentos): end the turn on an error the orchestrator can
+          // show — recorded on the message AND published, like `halt()` does
+          // for a provider error; a message error alone never leaves the fork.
+          const failTurn = Effect.fnUntraced(function* (
+            message: MessageV2.Assistant,
+            footprint: RequestFootprint.Info,
+            reason: RequestFootprint.Reason,
+          ) {
+            const error = new MessageV2.ContextOverflowError({
+              message: RequestFootprint.format(footprint, reason),
+            }).toObject()
+            message.error = error
+            message.finish = "error"
+            message.time.completed ??= Date.now()
+            yield* sessions.updateMessage(message)
+            yield* bus.publish(Session.Event.Error, { sessionID, error })
+          })
+
+          // Patched (agentos): every compaction this loop starts goes through
+          // here, so that none can start when it cannot help: not when the
+          // request's fixed overhead alone is over the threshold, and not when
+          // the previous compaction just failed to bring the request under it.
+          const requestCompaction = Effect.fnUntraced(function* (input: {
+            message: MessageV2.Assistant
+            model: Provider.Model
+            user: MessageV2.User
+            footprint: RequestFootprint.Info
+            rejected: boolean
+          }) {
+            const threshold = yield* compaction.threshold(input.model)
+            const next = nextOverflowCompaction({
+              consecutive: compactionStreak,
+              fixed: RequestFootprint.fixed(input.footprint),
+              threshold,
+            })
+            compactionStreak = next.consecutive
+            if (next.action === "no-room" && threshold !== undefined) {
+              yield* failTurn(input.message, input.footprint, { type: "no-room", threshold })
+              return "break" as const
+            }
+            if (next.action === "give-up") {
+              yield* failTurn(
+                input.message,
+                input.footprint,
+                input.rejected
+                  ? { type: "rejected", times: compactionStreak }
+                  : { type: "compaction-loop", times: compactionStreak },
+              )
+              return "break" as const
+            }
+            yield* compaction.create({
+              sessionID,
+              agent: input.user.agent,
+              model: input.user.model,
+              auto: true,
+              // Ask the processor directly whether the provider refused the
+              // request, instead of inferring it from a missing finish reason.
+              // `halt()` returns early on ContextOverflowError without setting
+              // `finish`, so `!handle.message.finish` did pick out the same
+              // cases — but only by accident of control flow, and it silently
+              // broke the moment anything else returned "compact" without a
+              // finish reason.
+              overflow: input.rejected,
+            })
+            return "continue" as const
+          })
           const session = yield* sessions.get(sessionID)
 
           // Patched (agentos/v1.4.6.3): re-drive any orphaned tool parts whose
@@ -2079,6 +2181,46 @@ NOTE: At any point in time through this workflow you should feel free to ask the
               const system = [...env, ...(skills ? [skills] : []), ...instructions]
               const format = lastUser.format ?? { type: "text" as const }
               if (format.type === "json_schema") system.push(STRUCTURED_OUTPUT_SYSTEM_PROMPT)
+
+              // Patched (agentos): measure the request before sending it — the
+              // same system prompt and tool set `LLM.stream` sends. A request
+              // the model cannot accept is not sent: if the excess is in the
+              // conversation, compact (what a provider rejection would lead
+              // to, minus the wasted request); if the tools and system prompt
+              // alone are the problem, end the turn with the numbers — which
+              // MCP server weighs how much — instead of a request that can only
+              // fail, or a compaction that can only loop.
+              const footprint = yield* Effect.promise(() =>
+                RequestFootprint.measure({
+                  model,
+                  system: [LLM.baseSystem({ agent, model, system, user: lastUser })],
+                  messages: modelMsgs,
+                  tools: LLM.resolveTools({ tools, agent, permission: session.permission, user: lastUser }),
+                  serverOf: MCP.serverOf,
+                }),
+              )
+              const preflight = RequestFootprint.preflight(footprint, yield* compaction.threshold(model))
+              if (preflight !== "send") {
+                if (preflight === "too-large") {
+                  yield* slog.warn("request too large, not sent", {
+                    total: footprint.total,
+                    inputLimit: footprint.inputLimit,
+                  })
+                  yield* failTurn(handle.message, footprint, { type: "too-large" })
+                  return "break" as const
+                }
+                // Never sent, so the processor never closes the message.
+                handle.message.time.completed = Date.now()
+                yield* sessions.updateMessage(handle.message)
+                return yield* requestCompaction({
+                  message: handle.message,
+                  model,
+                  user: lastUser,
+                  footprint,
+                  rejected: true,
+                })
+              }
+
               const result = yield* handle.process({
                 user: lastUser,
                 agent,
@@ -2106,65 +2248,32 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                 return "break" as const
               }
 
+              // Patched (agentos): a step that produced nothing ends the turn
+              // with the request's numbers — below the limit, a large tool set
+              // is still the first suspect.
+              if (
+                result !== "compact" &&
+                !handle.message.error &&
+                isEmptyStep({ parts: MessageV2.parts(handle.message.id), finish: handle.message.finish })
+              ) {
+                yield* failTurn(handle.message, RequestFootprint.withMeasuredInput(footprint, handle.message.tokens), {
+                  type: "empty",
+                  finish: handle.message.finish,
+                })
+                return "break" as const
+              }
+
               if (result === "stop") return "break" as const
               if (result === "compact") {
-                // Patched (agentos): stop the compaction doom loop.
-                //
-                // `"compact"` means one of two very different things. Either our
-                // own token accounting decided a compaction is due (routine — the
-                // next request is genuinely smaller), or the provider REFUSED the
-                // request as too large. In the second case compaction only helps
-                // if the excess is in the conversation. When it is not — tool
-                // schemas, system prompt, or simply a context window smaller than
-                // advertised — every compacted retry is rejected identically and
-                // the loop never terminates. Observed in production: 8 compactions
-                // in 45 seconds, ended only by the operator aborting the session.
-                //
-                // One rejection followed by a compaction is legitimate recovery.
-                // A second rejection right after proves compaction is not the
-                // remedy, so fail with something the operator can act on instead
-                // of burning their quota.
-                {
-                  const next = nextOverflowCompaction({
-                    rejected: handle.overflowRejected,
-                    consecutive: overflowCompactions,
-                  })
-                  overflowCompactions = next.consecutive
-                  if (next.giveUp) {
-                    const used = handle.message.tokens
-                    handle.message.error = new MessageV2.ContextOverflowError({
-                      message:
-                        `The provider rejected this request as too large ${overflowCompactions} times in a row, ` +
-                        `and compacting the conversation did not help — so the excess is not in the ` +
-                        `conversation history. Likely causes: too many tools/MCP servers for this model's ` +
-                        `context window, or a model whose real context window is smaller than advertised. ` +
-                        `Model ${lastUser.model.providerID}/${lastUser.model.modelID}, ` +
-                        `context limit ${model.limit.context}, ` +
-                        `last measured usage ${used.input + used.output + used.cache.read + used.cache.write} tokens, ` +
-                        `${Object.keys(tools).length} tools enabled.`,
-                    }).toObject()
-                    handle.message.finish = "error"
-                    yield* sessions.updateMessage(handle.message)
-                    return "break" as const
-                  }
-                }
-                yield* compaction.create({
-                  sessionID,
-                  agent: lastUser.agent,
-                  model: lastUser.model,
-                  auto: true,
-                  // Ask the processor directly whether the provider refused the
-                  // request, instead of inferring it from a missing finish
-                  // reason. `halt()` returns early on ContextOverflowError
-                  // without setting `finish`, so `!handle.message.finish` did
-                  // pick out the same cases — but only by accident of control
-                  // flow, and it silently broke the moment anything else
-                  // returned "compact" without a finish reason.
-                  overflow: handle.overflowRejected,
+                return yield* requestCompaction({
+                  message: handle.message,
+                  model,
+                  user: lastUser,
+                  footprint: RequestFootprint.withMeasuredInput(footprint, handle.message.tokens),
+                  rejected: handle.overflowRejected,
                 })
-              } else {
-                overflowCompactions = 0
               }
+              compactionStreak = 0
               return "continue" as const
             }).pipe(Effect.ensuring(instruction.clear(handle.message.id)))
             if (outcome === "break") break

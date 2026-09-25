@@ -93,19 +93,7 @@ export namespace LLM {
           // TODO: move this to a proper hook
           const isOpenaiOauth = item.id === "openai" && info?.type === "oauth"
 
-          const system: string[] = []
-          system.push(
-            [
-              // use agent prompt otherwise provider prompt
-              ...(input.agent.prompt ? [input.agent.prompt] : SystemPrompt.provider(input.model)),
-              // any custom prompt passed into this call
-              ...input.system,
-              // any custom prompt from last user message
-              ...(input.user.system ? [input.user.system] : []),
-            ]
-              .filter((x) => x)
-              .join("\n"),
-          )
+          const system: string[] = [baseSystem(input)]
 
           const header = system[0]
           yield* plugin.trigger(
@@ -430,7 +418,25 @@ export namespace LLM {
     ),
   )
 
-  function resolveTools(input: Pick<StreamInput, "tools" | "agent" | "permission" | "user">) {
+  /**
+   * The system prompt as sent, before plugins transform it. Patched (agentos):
+   * exported, with `resolveTools`, so the request footprint measures the same
+   * system prompt and the same tool set that `stream` sends.
+   */
+  export function baseSystem(input: Pick<StreamInput, "agent" | "model" | "system" | "user">) {
+    return [
+      // use agent prompt otherwise provider prompt
+      ...(input.agent.prompt ? [input.agent.prompt] : SystemPrompt.provider(input.model)),
+      // any custom prompt passed into this call
+      ...input.system,
+      // any custom prompt from last user message
+      ...(input.user.system ? [input.user.system] : []),
+    ]
+      .filter((x) => x)
+      .join("\n")
+  }
+
+  export function resolveTools(input: Pick<StreamInput, "tools" | "agent" | "permission" | "user">) {
     const disabled = Permission.disabled(
       Object.keys(input.tools),
       Permission.merge(input.agent.permission, input.permission ?? []),

@@ -1,58 +1,134 @@
 import { describe, expect, test } from "bun:test"
 import { SessionCompaction } from "../../src/session/compaction"
 import { SessionPrompt } from "../../src/session/prompt"
+import type { MessageV2 } from "../../src/session/message-v2"
+import type { Config } from "../../src/config/config"
+import type { Provider } from "../../src/provider/provider"
+import { compactionThreshold } from "../../src/session/overflow"
 
 // Pure decision logic behind the two overflow patches. Kept separate from
 // `compaction.test.ts` because those tests need a real temp directory and this
 // file deliberately needs nothing at all.
 describe("session overflow guard", () => {
   describe("SessionPrompt.nextOverflowCompaction", () => {
-    test("does not count our own pre-emptive compactions", () => {
-      // Token accounting decided a compaction is due — always safe, always
-      // shrinks the next request. Must never trip the breaker, no matter how
-      // often a long session does it.
-      let state = { consecutive: 0, giveUp: false }
-      for (let i = 0; i < 50; i++) {
-        state = SessionPrompt.nextOverflowCompaction({ rejected: false, consecutive: state.consecutive })
-        expect(state.giveUp).toBe(false)
-        expect(state.consecutive).toBe(0)
-      }
+    // Small fixed overhead, threshold 252k (gpt-5.6 on a ChatGPT subscription:
+    // input 272k minus the 20k compaction buffer).
+    const roomy = { fixed: 20_000, threshold: 252_000 }
+
+    test("allows exactly one compaction — normal recovery", () => {
+      expect(SessionPrompt.nextOverflowCompaction({ ...roomy, consecutive: 0 })).toEqual({
+        action: "compact",
+        consecutive: 1,
+      })
     })
 
-    test("allows exactly one compaction in response to a provider rejection", () => {
-      const first = SessionPrompt.nextOverflowCompaction({ rejected: true, consecutive: 0 })
-      expect(first).toEqual({ consecutive: 1, giveUp: false })
+    test("gives up when the request built from the compacted conversation needs compacting again", () => {
+      // Counts our own pre-emptive compactions too: the production loop never
+      // saw a single provider rejection — every step was simply over the
+      // threshold again.
+      expect(SessionPrompt.nextOverflowCompaction({ ...roomy, consecutive: 1 })).toEqual({
+        action: "give-up",
+        consecutive: 2,
+      })
     })
 
-    test("gives up when a rejection follows the compaction that was meant to fix it", () => {
-      const second = SessionPrompt.nextOverflowCompaction({ rejected: true, consecutive: 1 })
-      expect(second.giveUp).toBe(true)
-      expect(second.consecutive).toBe(2)
-    })
-
-    test("an accepted request in between resets the breaker", () => {
-      // Rejection → compaction → the request goes through → later, a fresh
-      // rejection. That is not a loop, so the second rejection gets its own
-      // compaction rather than being treated as the doomed retry.
-      const rejected = SessionPrompt.nextOverflowCompaction({ rejected: true, consecutive: 0 })
-      const accepted = SessionPrompt.nextOverflowCompaction({ rejected: false, consecutive: rejected.consecutive })
-      expect(accepted.consecutive).toBe(0)
-      const again = SessionPrompt.nextOverflowCompaction({ rejected: true, consecutive: accepted.consecutive })
-      expect(again.giveUp).toBe(false)
-    })
-
-    test("terminates — the production loop ran 8 compactions in 45s", () => {
-      // Drive it the way runLoop does and assert it stops. Without the guard
-      // this is an infinite sequence.
+    test("terminates — the production loop compacted until the operator stopped it", () => {
+      // Drive it the way runLoop does when every step asks for a compaction.
       let consecutive = 0
       let compactions = 0
       for (let i = 0; i < 100; i++) {
-        const next = SessionPrompt.nextOverflowCompaction({ rejected: true, consecutive })
+        const next = SessionPrompt.nextOverflowCompaction({ ...roomy, consecutive })
         consecutive = next.consecutive
-        if (next.giveUp) break
+        if (next.action !== "compact") break
         compactions++
       }
       expect(compactions).toBe(1)
+    })
+
+    test("refuses even the first compaction when the fixed overhead alone reaches the threshold", () => {
+      // The ElevenLabs case: ~325k of system prompt + tool schemas against a
+      // 252k threshold. Compaction only shrinks the conversation, so it can
+      // never get the request under the line.
+      expect(SessionPrompt.nextOverflowCompaction({ fixed: 325_000, threshold: 252_000, consecutive: 0 })).toEqual({
+        action: "no-room",
+        consecutive: 0,
+      })
+      expect(SessionPrompt.nextOverflowCompaction({ fixed: 252_000, threshold: 252_000, consecutive: 0 }).action).toBe(
+        "no-room",
+      )
+    })
+
+    test("without auto-compaction there is no threshold to compare the overhead with", () => {
+      expect(
+        SessionPrompt.nextOverflowCompaction({ fixed: 325_000, threshold: undefined, consecutive: 0 }).action,
+      ).toBe("compact")
+    })
+  })
+
+  describe("compactionThreshold", () => {
+    const cfg = {} as Config.Info
+    const model = (limit: Provider.Model["limit"]) => ({ limit }) as Provider.Model
+
+    test("input limit minus the compaction buffer", () => {
+      expect(compactionThreshold({ cfg, model: model({ context: 400_000, input: 272_000, output: 128_000 }) })).toBe(
+        252_000,
+      )
+    })
+
+    test("no threshold when the window is unknown — never a negative one", () => {
+      // A model from the config without `limit` has context 0. A threshold of
+      // 0 − 32k made every provider rejection end in a bogus "no room".
+      expect(compactionThreshold({ cfg, model: model({ context: 0, output: 0 }) })).toBeUndefined()
+      expect(
+        SessionPrompt.nextOverflowCompaction({
+          fixed: 20_000,
+          threshold: compactionThreshold({ cfg, model: model({ context: 0, output: 0 }) }),
+          consecutive: 0,
+        }).action,
+      ).toBe("compact")
+    })
+  })
+
+  describe("SessionPrompt.isEmptyStep", () => {
+    const base = { id: "prt_1", sessionID: "ses_1", messageID: "msg_1" } as const
+    const markers = [
+      { ...base, type: "step-start" },
+      { ...base, type: "step-finish", reason: "length" },
+    ] as unknown as MessageV2.Part[]
+
+    test("only step markers and finish=length is empty — the luna production case", () => {
+      expect(SessionPrompt.isEmptyStep({ parts: markers, finish: "length" })).toBe(true)
+    })
+
+    test("finishes that explain nothing count too: other, unknown, none", () => {
+      for (const finish of ["other", "unknown", undefined]) {
+        expect(SessionPrompt.isEmptyStep({ parts: markers, finish })).toBe(true)
+      }
+    })
+
+    test("an empty reply with its own explanation is not ours to report", () => {
+      // content-filter, or an empty `stop` after tool results — the request's
+      // size has nothing to do with it; the orchestrator reports it neutrally.
+      for (const finish of ["content-filter", "stop", "tool-calls", "error"]) {
+        expect(SessionPrompt.isEmptyStep({ parts: markers, finish })).toBe(false)
+      }
+    })
+
+    test("an empty text part is still nothing", () => {
+      const parts = [{ ...base, type: "text", text: "" }] as unknown as MessageV2.Part[]
+      expect(SessionPrompt.isEmptyStep({ parts, finish: "length" })).toBe(true)
+    })
+
+    test("text, reasoning or a tool call is something", () => {
+      for (const part of [
+        { ...base, type: "text", text: "Hi" },
+        { ...base, type: "reasoning", text: "…" },
+        { ...base, type: "tool", tool: "bash" },
+      ]) {
+        expect(SessionPrompt.isEmptyStep({ parts: [part] as unknown as MessageV2.Part[], finish: "length" })).toBe(
+          false,
+        )
+      }
     })
   })
 

@@ -1578,3 +1578,157 @@ it.live(
     ),
   30_000,
 )
+
+// Patched (agentos): request footprint — the runLoop wiring behind
+// RequestFootprint.preflight, the empty-step check and the compaction streak.
+
+function limitedCfg(limit: { context: number; input?: number; output: number }) {
+  return (url: string) => {
+    const base = providerCfg(url)
+    const test = base.provider.test
+    return {
+      ...base,
+      provider: {
+        ...base.provider,
+        test: { ...test, models: { "test-model": { ...test.models["test-model"], limit } } },
+      },
+    }
+  }
+}
+
+const footprintChat = Effect.fn("test.footprintChat")(function* () {
+  const prompt = yield* SessionPrompt.Service
+  const sessions = yield* Session.Service
+  const bus = yield* Bus.Service
+  const chat = yield* sessions.create({
+    title: "Footprint",
+    permission: [{ permission: "*", pattern: "*", action: "allow" }],
+  })
+  const published: string[] = []
+  const off = yield* bus.subscribeCallback(Session.Event.Error, (evt) => {
+    if (evt.properties.sessionID !== chat.id || !evt.properties.error) return
+    published.push(evt.properties.error.name)
+  })
+  yield* Effect.addFinalizer(() => Effect.sync(off))
+  yield* prompt.prompt({
+    sessionID: chat.id,
+    agent: "build",
+    noReply: true,
+    parts: [{ type: "text", text: "hello" }],
+  })
+  // Bus delivery is asynchronous: give it a moment before reading.
+  const errors = Effect.fnUntraced(function* () {
+    for (let i = 0; i < 20 && published.length === 0; i++) yield* Effect.sleep("25 millis")
+    return published
+  })
+  return { prompt, chat, errors }
+})
+
+function errorText(info: MessageV2.Info) {
+  if (info.role !== "assistant" || !info.error) return undefined
+  return `${info.error.name}: ${"message" in info.error.data ? String(info.error.data.message) : ""}`
+}
+
+it.live("preflight: a request the model cannot accept is never sent, and the turn fails with the numbers", () =>
+  provideTmpdirServer(
+    Effect.fnUntraced(function* ({ llm }) {
+      // A 3,000-token input limit: the system prompt and built-in tools alone
+      // are over it, so compaction cannot help.
+      const { prompt, chat, errors } = yield* footprintChat()
+
+      const result = yield* prompt.loop({ sessionID: chat.id })
+
+      expect(yield* llm.calls).toBe(0)
+      expect(errorText(result.info)).toStartWith("ContextOverflowError: Request too large for test/test-model: ≈")
+      expect(errorText(result.info)).toContain("the model accepts 3,000 input tokens (context window 4,000)")
+      expect(result.info.role === "assistant" && result.info.finish).toBe("error")
+      // Published, not only recorded — the orchestrator never reads it otherwise.
+      expect(yield* errors()).toEqual(["ContextOverflowError"])
+    }),
+    { git: true, config: limitedCfg({ context: 4_000, input: 3_000, output: 1_000 }) },
+  ),
+)
+
+it.live("an empty step ending on the output-token limit fails the turn with the request's numbers", () =>
+  provideTmpdirServer(
+    Effect.fnUntraced(function* ({ llm }) {
+      const { prompt, chat, errors } = yield* footprintChat()
+      yield* llm.push(reply().length())
+
+      const result = yield* prompt.loop({ sessionID: chat.id })
+
+      expect(yield* llm.calls).toBe(1)
+      expect(errorText(result.info)).toStartWith(
+        "ContextOverflowError: test/test-model returned no content (finish: length).",
+      )
+      expect(errorText(result.info)).toContain("Large tool sets can make a model fail even below its input limit.")
+      expect(yield* errors()).toEqual(["ContextOverflowError"])
+    }),
+    { git: true, config: providerCfg },
+  ),
+)
+
+it.live("an empty stop is left to the orchestrator — no overflow error from the fork", () =>
+  provideTmpdirServer(
+    Effect.fnUntraced(function* ({ llm }) {
+      const { prompt, chat, errors } = yield* footprintChat()
+      yield* llm.push(reply().stop())
+
+      const result = yield* prompt.loop({ sessionID: chat.id })
+
+      expect(yield* llm.calls).toBe(1)
+      expect(errorText(result.info)).toBeUndefined()
+      expect(yield* errors()).toEqual([])
+    }),
+    { git: true, config: providerCfg },
+  ),
+)
+
+// test-model: 100,000 window, 10,000 output → compaction at 90,000. 80,000 in +
+// 15,000 out is over it, while 80,000 of input stays under it as fixed overhead,
+// so compaction is allowed to try.
+const overThreshold = { usage: { input: 80_000, output: 15_000 } }
+const small = { usage: { input: 100, output: 10 } }
+
+it.live("two compactions in a row with nothing fitting in between end the turn", () =>
+  provideTmpdirServer(
+    Effect.fnUntraced(function* ({ llm }) {
+      const { prompt, chat, errors } = yield* footprintChat()
+      yield* llm.text("one", overThreshold)
+      yield* llm.text("summary", small)
+      yield* llm.text("two", overThreshold)
+
+      const result = yield* prompt.loop({ sessionID: chat.id })
+
+      // step, compaction, step — and no second compaction.
+      expect(yield* llm.calls).toBe(3)
+      expect(errorText(result.info)).toStartWith(
+        "ContextOverflowError: Stopped after 2 compactions in a row on test/test-model",
+      )
+      expect(yield* errors()).toEqual(["ContextOverflowError"])
+    }),
+    { git: true, config: providerCfg },
+  ),
+)
+
+it.live("a step that fits resets the compaction streak", () =>
+  provideTmpdirServer(
+    Effect.fnUntraced(function* ({ llm }) {
+      const { prompt, chat, errors } = yield* footprintChat()
+      yield* llm.text("one", overThreshold)
+      yield* llm.text("summary", small)
+      yield* llm.tool("first", { value: "first" }) // fits → streak back to 0
+      yield* llm.text("two", overThreshold)
+      yield* llm.text("summary again", small)
+      yield* llm.text("done", small)
+
+      const result = yield* prompt.loop({ sessionID: chat.id })
+
+      expect(yield* llm.calls).toBe(6)
+      expect(errorText(result.info)).toBeUndefined()
+      expect(result.parts.some((part) => part.type === "text" && part.text === "done")).toBe(true)
+      expect(yield* errors()).toEqual([])
+    }),
+    { git: true, config: providerCfg },
+  ),
+)

@@ -493,6 +493,15 @@ export class Reply {
     return this
   }
 
+  /** End on the output-token limit — with nothing before it, the empty reply of an oversized request. */
+  length() {
+    this.#finish = "length"
+    this.#hang = false
+    this.#error = undefined
+    this.#reset = false
+    return this
+  }
+
   toolCalls() {
     this.#finish = "tool_calls"
     this.#hang = false
